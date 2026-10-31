@@ -1,0 +1,41 @@
+{
+  "fps": 30,
+  "frames": 120,
+  "duration_seconds": 4.0,
+  "width": 512,
+  "height": 512,
+  "clips": {
+    "damped_pendulum.mp4": {
+      "L_meters": 0.5,
+      "gamma": 0.15,
+      "g": 9.81,
+      "omega0_squared": 19.62,
+      "theta0": 0.9,
+      "angular_velocity0": 0,
+      "pivot_screen_pixels": [
+        256,
+        48
+      ],
+      "L_pixels": 280,
+      "equation": "theta_ddot = -gamma*theta_dot - (g/L)*sin(theta)"
+    },
+    "falling_drag_sphere.mp4": {
+      "g": 9.81,
+      "quadratic_drag_per_meter": 0.65,
+      "distance0": 0,
+      "velocity0": 0,
+      "pixels_per_meter": 26.0,
+      "origin_screen_y": 45,
+      "equation": "distance_ddot = g - k*velocity*abs(velocity)"
+    },
+    "bouncing_ball.mp4": {
+      "g": 9.81,
+      "e": 0.82,
+      "initial_height_meters": 2.4,
+      "velocity0": 0,
+      "pixels_per_meter": 160,
+      "floor_center_screen_y": 453,
+      "equation": "height_ddot = -g; at height=0, v_after=-e*v_before"
+    }
+  }
+}

@@ -23,9 +23,9 @@ from backend.kinematics import parse_sam_frame
 
 
 def circle_data_url() -> str:
-    image = np.zeros((64, 64, 3), dtype=np.uint8)
-    cv2.circle(image, (32, 32), 16, (255, 255, 255), thickness=-1)
-    success, png = cv2.imencode(".png", image)
+    img = np.full((256, 256, 3), 220, dtype=np.uint8)
+    cv2.circle(img, (128, 128), 50, (30, 30, 220), -1)
+    success, png = cv2.imencode(".png", img)
     if not success:
         raise RuntimeError("Could not encode the synthetic PNG")
     return "data:image/png;base64," + base64.b64encode(png.tobytes()).decode("ascii")
@@ -52,7 +52,7 @@ async def main() -> None:
             input=[{
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": "white circle"},
+                    {"type": "input_text", "text": "red circle"},
                     {"type": "input_image", "image_url": circle_data_url()},
                 ],
             }],
