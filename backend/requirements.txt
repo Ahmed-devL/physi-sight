@@ -1,0 +1,11 @@
+# Python 3.11+
+openai
+meta_sam_parser
+numpy
+scipy
+pysindy
+fastapi
+uvicorn
+opencv-python
+python-dotenv
+pytest

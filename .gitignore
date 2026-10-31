@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# PhysiSight local documentation, frontend dependencies, and caches
+specs/
+.specs/
+.venv/
+node_modules/
+backend/cache/*.json
