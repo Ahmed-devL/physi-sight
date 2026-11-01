@@ -53,6 +53,8 @@ async def _analyze(path, force_live, model_provider, known_object_width_cm=None,
             registered = _manifest()["clips"].get(path.name, {})
             if "regime" in registered and "object_prompt" in registered:
                 options.update(regime=registered["regime"], object_prompt=registered["object_prompt"])
+            if "trim_window_seconds" in registered:
+                options["trim_window_seconds"] = registered["trim_window_seconds"]
         if known_object_width_cm is not None:
             options["known_object_width_cm"] = known_object_width_cm
         if known_length_cm is not None:

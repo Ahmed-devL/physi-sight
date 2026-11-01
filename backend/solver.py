@@ -105,7 +105,10 @@ def _score(name, coefficients, initial, prediction, y, split, count, proposal):
     bic = split * np.log(rss / split) + count * np.log(split)
     error = prediction[split:] - y[split:]
     variance = np.sum((y[split:] - y[split:].mean()) ** 2)
-    r2 = float(1 - np.sum(error**2) / variance) if variance > 0 else float("nan")
+    # Finite constant-target convention: perfect forecast = 1, otherwise 0.
+    # Keep genuinely negative R² values intact for alternative-model comparisons.
+    squared_error = float(np.sum(error**2))
+    r2 = float(1 - squared_error / variance) if variance > 0 else float(squared_error == 0)
     return FitResult(name, coefficients, initial, prediction, split, float(bic),
                      r2, float(np.sqrt(np.mean(error**2))), proposal)
 

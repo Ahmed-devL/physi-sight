@@ -8,12 +8,14 @@ from time import perf_counter
 import xml.etree.ElementTree as ET
 
 from fastapi.testclient import TestClient
+import cv2
 import numpy as np
 import pytest
 
 from backend.app import app, calibrate, CalibrationRequest
 from backend.kinematics import (MaskMoments, interpolate_trajectory, select_primary_track,
-                                mask_size_metrics, normalize_video, is_normalized_video)
+                                mask_size_metrics, normalize_video, is_normalized_video,
+                                find_active_motion_window)
 from backend.solver import calibrate_physical_metrics, simulate_counterfactual
 
 
@@ -143,11 +145,14 @@ def test_normalization_command_and_error_handling(tmp_path, monkeypatch):
     import backend.kinematics as kinematics
     calls = []
     monkeypatch.setattr(kinematics.subprocess, 'run', lambda command, **kwargs: calls.append(command))
+    monkeypatch.setattr(kinematics, 'find_active_motion_window', lambda path: (4.0, 8.5))
     source, target = tmp_path/'phone.mp4', tmp_path/'normalized.mp4'
     assert normalize_video(source, target) == target
     cmd = calls[0]
     assert cmd[cmd.index('-vf')+1] == 'fps=30,scale=-2:720'
-    assert cmd[cmd.index('-t')+1] == '5.0'
+    assert cmd[cmd.index('-ss')+1] == '4.000'
+    assert cmd.index('-ss') < cmd.index('-i')
+    assert cmd[cmd.index('-t')+1] == '4.500'
     assert cmd[cmd.index('-c:v')+1] == 'libx264'
     assert '-an' in cmd
     with pytest.raises(ValueError):
@@ -208,3 +213,99 @@ def test_agent_normalizes_phone_video_before_analysis_and_keeps_playback(tmp_pat
         assert 'g_measured_m_s2' not in second['inferred_physical_metrics']
         assert paths[0] == paths[1] and paths[0].exists()
     asyncio.run(run())
+
+
+def test_active_motion_window_skips_stationary_setup(tmp_path, monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+    import backend.agent as agent
+    from backend.cache import DiskCache
+    source = tmp_path / 'held_pendulum.mp4'
+    writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*'mp4v'), 30, (160, 120))
+    assert writer.isOpened()
+    try:
+        for i in range(300):
+            t = i / 30
+            phase = min(max(t - 4, 0), 4.5)
+            x = round(80 + 45 * np.sin(2 * np.pi * phase))
+            frame = np.zeros((120, 160, 3), np.uint8)
+            cv2.circle(frame, (x, 60), 9, (255, 255, 255), -1)
+            writer.write(frame)
+    finally:
+        writer.release()
+    start, end = find_active_motion_window(source)
+    assert start == pytest.approx(4.0, abs=.35)
+    assert end - start == pytest.approx(4.5)
+    assert 0 <= start < end <= 10
+    assert find_active_motion_window(source, max_scan_s=3) == (0.0, 3.0)
+    async def fake_analysis(path, **kwargs):
+        metadata, _ = agent._video_info(path)
+        # Seeking and fps resampling can round the edge by one frame.
+        assert metadata['frames'] == pytest.approx(135, abs=1)
+        assert metadata['fps'] == 30
+        assert metadata['height'] == 720
+        return {**analysis('pendulum'), 'video_metadata': metadata}
+    monkeypatch.setattr(agent, '_analyze_video', AsyncMock(side_effect=fake_analysis))
+    cache = DiskCache(tmp_path / 'cache')
+    async def run():
+        first = await agent.analyze_video(source, cache=cache)
+        assert first['video_metadata']['trim_window_seconds'] == pytest.approx([start, end])
+        def unexpected_scan(*args):
+            pytest.fail('Normalized cache hit rescanned source video')
+        monkeypatch.setattr(agent, 'find_active_motion_window', unexpected_scan)
+        second = await agent.analyze_video(source, cache=cache)
+        assert second['video_metadata']['trim_window_seconds'] == first['video_metadata']['trim_window_seconds']
+        assert second['video_url'] == first['video_url']
+    asyncio.run(run())
+
+
+def test_active_motion_window_keeps_short_clips_and_rejects_invalid_input(tmp_path):
+    source = Path(__file__).resolve().parents[1] / 'backend/demo_clips/damped_pendulum.mp4'
+    capture = cv2.VideoCapture(str(source))
+    duration = capture.get(cv2.CAP_PROP_FRAME_COUNT) / capture.get(cv2.CAP_PROP_FPS)
+    capture.release()
+    assert find_active_motion_window(source) == (0.0, duration)
+    with pytest.raises(ValueError):
+        find_active_motion_window(tmp_path / 'missing.mp4')
+    for options in ({'target_duration_s': 0}, {'max_scan_s': float('nan')}):
+        with pytest.raises(ValueError):
+            find_active_motion_window(source, **options)
+
+
+@pytest.mark.parametrize('regime', ['pendulum', 'drag_fall', 'bouncing_ball'])
+def test_all_comparison_candidates_have_numeric_heldout_scores(regime):
+    from backend.agent import fit_observations
+    data = analysis(regime)
+    masks = []
+    for i, point in enumerate(data['trajectory_points']):
+        position = point['y_px']
+        if regime == 'pendulum':
+            x, y = 80 + 50 * np.sin(position), 60 + 50 * np.cos(position)
+        else:
+            x, y = 80., 720 - position
+        masks.append(MaskMoments('ball', i, (0, 0, 19, 19), np.ones((20, 20), np.uint8),
+                                 400, float(x), float(y), None, 0, 0, 0))
+    metadata = {'fps': 30, 'frames': 90, 'height': 720, 'timestamps': (np.arange(90)/30).tolist()}
+    result = fit_observations(masks, metadata, regime)
+    table = result['candidate_comparison_table']
+    assert len(table) > 1
+    if regime != 'bouncing_ball':
+        assert any(row['name'] == 'polynomial_degree_5' for row in table)
+    for row in table:
+        assert isinstance(row['heldout_r2'], (int, float))
+        assert isinstance(row['heldout_rmse'], (int, float))
+        assert np.isfinite(row['heldout_r2'])
+        assert np.isfinite(row['heldout_rmse'])
+        assert row['heldout_rmse'] >= 0
+        if row['selected']:
+            assert row['heldout_r2'] == result['heldout_r2']
+            assert row['heldout_rmse'] == result['heldout_rmse']
+
+
+def test_constant_heldout_r2_is_finite():
+    from backend.solver import _score
+    y = np.ones(20)
+    perfect = _score('constant', {}, (1., 0.), y.copy(), y, 14, 2, {})
+    wrong = _score('constant', {}, (0., 0.), np.zeros(20), y, 14, 2, {})
+    assert perfect.heldout_r2 == 1.0
+    assert wrong.heldout_r2 == 0.0

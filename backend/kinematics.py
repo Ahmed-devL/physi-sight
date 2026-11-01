@@ -237,15 +237,105 @@ def mask_size_metrics(masks, track):
     }
 
 
-def normalize_video(input_path, output_path):
-    """Normalize VFR/phone video, including rotation, to at most five seconds."""
+def find_active_motion_window(video_path: str | Path, target_duration_s: float = 4.5,
+                              max_scan_s: float = 30.0) -> tuple[float, float]:
+    """Find sustained motion using small grayscale samples at approximately 6 Hz.
+
+    Score windows with capped energy so a brief hand movement cannot outweigh
+    sustained swings. Bridge turnarounds and favor a sample before onset when
+    scores are close. Decode cost depends on source resolution/codec; only sampled
+    frames are retrieved and converted, and the scan never exceeds max_scan_s.
+    """
+    if not np.all(np.isfinite([target_duration_s, max_scan_s])) or min(target_duration_s, max_scan_s) <= 0:
+        raise ValueError("Window and scan durations must be positive and finite")
+    # One decoder thread avoids thread-pool startup overhead on this tiny scan.
+    capture = cv2.VideoCapture(str(video_path), cv2.CAP_FFMPEG,
+                               [cv2.CAP_PROP_N_THREADS, 1])
+    try:
+        if not capture.isOpened():
+            raise ValueError("Cannot decode MP4 video")
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+        if not np.all(np.isfinite([fps, count])) or fps <= 0 or count <= 0:
+            raise ValueError("Video requires a valid duration and FPS")
+        duration = float(count / fps)
+        if duration <= 5.0:
+            return 0.0, duration
+        scan_end = min(duration, max_scan_s)
+        window = min(target_duration_s, scan_end)
+        step = max(1, round(fps / 6))
+        dt = step / fps
+        previous, times, energies = None, [], []
+        for index in range(int(np.ceil(scan_end * fps))):
+            if not capture.grab():
+                break
+            if index % step:
+                continue
+            ok, frame = capture.retrieve()
+            if not ok:
+                raise ValueError("Cannot decode motion scan frame")
+            height, width = frame.shape[:2]
+            small = cv2.resize(frame, (96, max(1, round(96 * height / width))), interpolation=cv2.INTER_AREA)
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            if previous is not None:
+                times.append(index / fps)
+                energies.append(float(cv2.absdiff(gray, previous).mean()))
+            previous = gray
+    finally:
+        capture.release()
+    if len(energies) < 3:
+        return 0.0, window
+    energy = np.asarray(energies)
+    smooth = np.convolve(np.pad(energy, (1, 1), mode="edge"), np.ones(3) / 3, mode="valid")
+    baseline, peak = np.percentile(smooth, [20, 90])
+    if peak < 0.02:
+        return 0.0, window
+    active = smooth > baseline + max(0.02, .15 * (peak - baseline))
+    # Join short gaps at pendulum extrema; isolated transients remain separate.
+    hits = np.flatnonzero(active)
+    for left, right in zip(hits[:-1], hits[1:]):
+        if (right - left) * dt <= .5:
+            active[left:right+1] = True
+    boundaries = np.diff(np.r_[False, active, False].astype(int))
+    starts, stops = np.flatnonzero(boundaries == 1), np.flatnonzero(boundaries == -1)
+    sustained = np.zeros(len(active), dtype=bool)
+    onsets = []
+    for start, stop in zip(starts, stops):
+        if (stop - start) * dt >= .5:
+            sustained[start:stop] = True
+            onsets.append(max(0.0, min(float(times[start]) - dt, scan_end - window)))
+    if not onsets:
+        return 0.0, window
+    weights = np.minimum(np.maximum(smooth - baseline, 0), peak) * sustained
+    stamps = np.asarray(times)
+    # Search the whole scan, including stronger motion later in a long run.
+    candidates = np.unique(np.r_[0.0, stamps[stamps <= scan_end - window],
+                                  scan_end - window, onsets])
+    cumulative = np.r_[0.0, np.cumsum(weights)]
+    def score(start):
+        left, right = np.searchsorted(stamps, [start, start + window])
+        return float(cumulative[right] - cumulative[left])
+    start = max(candidates, key=score)
+    # Near-equivalent onset windows retain the first release instead of
+    # shaving it off to gain a small amount of energy at the far end.
+    onset_windows = [onset for onset in onsets if abs(onset - start) <= .5
+                     and score(onset) >= .95 * score(start)]
+    if onset_windows:
+        start = min(onset_windows)
+    return float(start), float(start + window)
+
+
+def normalize_video(input_path, output_path, *, trim_window_seconds=None):
+    """Normalize VFR/phone video, including rotation, around active motion."""
     source, target = Path(input_path), Path(output_path)
     if source.resolve() == target.resolve():
         raise ValueError("Normalization requires a separate output path")
+    start, end = (find_active_motion_window(source) if trim_window_seconds is None
+                  else trim_window_seconds)
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run([
-            "ffmpeg", "-y", "-i", str(source), "-t", "5.0",
+            "ffmpeg", "-y", "-ss", f"{start:.3f}", "-i", str(source), "-t", f"{end - start:.3f}",
             "-vf", "fps=30,scale=-2:720", "-c:v", "libx264", "-pix_fmt", "yuv420p",
             "-movflags", "+faststart", "-an", str(target),
         ], check=True, capture_output=True)

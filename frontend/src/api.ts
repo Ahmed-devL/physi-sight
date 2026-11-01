@@ -19,14 +19,14 @@ export interface Analysis {
   inferred_physical_metrics: Record<string, number>;
   train_r2: number | null; heldout_r2: number | null; heldout_rmse: number | null;
   metric_units: string;
-  candidate_comparison_table: { name: string; bic: number | null; heldout_rmse: number | null; selected: boolean }[];
+  candidate_comparison_table: { name: string; bic: number | null; heldout_r2: number; heldout_rmse: number; selected: boolean }[];
   trajectory_points: Point[];
   initial_state: [number, number];
   pivot_or_bounds: Record<string, number>;
   selected_candidate: string;
   reasoning_steps: { step: number; hypothesis: string; evidence: string; conclusion: string }[];
   object_prompt: string;
-  video_metadata: { fps: number; frames: number; width: number; height: number; timestamps: number[] };
+  video_metadata: { fps: number; frames: number; width: number; height: number; timestamps: number[]; trim_window_seconds?: [number, number] };
   background_image: string;
   model_provider: Provider;
   cache_hit: boolean;

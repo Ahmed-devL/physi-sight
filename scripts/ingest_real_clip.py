@@ -11,7 +11,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from backend.agent import analyze_video, _video_info
-from backend.kinematics import normalize_video
+from backend.kinematics import normalize_video, find_active_motion_window
 
 
 async def main():
@@ -35,8 +35,10 @@ async def main():
     target = directory / args.name
     if target.exists():
         parser.error(f'Clip already exists: {args.name}; choose a new name')
+    trim_window = find_active_motion_window(args.path)
     with tempfile.TemporaryDirectory(dir=directory) as temporary:
-        normalized = normalize_video(args.path, Path(temporary) / 'normalized.mp4')
+        normalized = normalize_video(args.path, Path(temporary) / 'normalized.mp4',
+                                     trim_window_seconds=trim_window)
         metadata, _ = _video_info(normalized)
         normalized.replace(target)
     manifest_path = directory / 'manifest.json'
@@ -45,6 +47,7 @@ async def main():
         'regime': args.regime, 'object_prompt': args.prompt, 'normalized': True,
         **{k: metadata[k] for k in ('fps', 'frames', 'width', 'height')},
         'duration_seconds': metadata['frames'] / metadata['fps'],
+        'trim_window_seconds': list(trim_window),
     }
     with tempfile.NamedTemporaryFile(mode='w', dir=directory, delete=False) as output:
         json.dump(manifest, output, indent=2)
@@ -52,9 +55,10 @@ async def main():
     Path(output.name).replace(manifest_path)
     result = await analyze_video(target, force_live=True, regime=args.regime, object_prompt=args.prompt,
                                  known_object_width_cm=args.known_object_width_cm,
-                                 known_length_cm=args.known_length_cm)
+                                 known_length_cm=args.known_length_cm, trim_window_seconds=trim_window)
     print(json.dumps({key: result[key] for key in (
-        'latex_equation', 'discovered_params', 'heldout_r2', 'inferred_physical_metrics')}, indent=2))
+        'latex_equation', 'discovered_params', 'heldout_r2', 'inferred_physical_metrics',
+        'video_metadata')}, indent=2))
 
 
 if __name__ == '__main__':

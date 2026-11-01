@@ -22,6 +22,7 @@ from backend.kinematics import (
     MaskMoments, extract_median_background, fit_pendulum_pivot,
     infer_pendulum_length, interpolate_trajectory, parse_sam_video,
     select_primary_track, mask_size_metrics, normalize_video, is_normalized_video, detect_release_index,
+    find_active_motion_window,
 )
 from backend.solver import fit_trajectory, calibrate_physical_metrics
 
@@ -232,7 +233,7 @@ def fit_observations(masks, metadata, regime):
             "candidate_comparison_table": table, "trajectory_points": points,
             "initial_state": list(best.initial_state), "pivot_or_bounds": geometry,
             "selected_candidate": best.name, "release_frame_idx": int(indices[release]),
-            "release_time": float(times[release]), "fit_version": 2}
+            "release_time": float(times[release]), "fit_version": 3}
 
 
 def _finite(value):
@@ -273,7 +274,7 @@ async def hypothesis_loop(evidence, model_provider):
 
 async def analyze_video(video_path, *, force_live=False, model_provider="meta", cache=None,
                         known_object_width_cm=None, known_length_cm=None,
-                        regime=None, object_prompt=None):
+                        regime=None, object_prompt=None, trim_window_seconds=None):
     cache = cache if cache is not None else DiskCache()
     path = Path(video_path)
     # Shipped Gate 0–4 clips are already CFR H.264 and keep their verified geometry.
@@ -283,17 +284,24 @@ async def analyze_video(video_path, *, force_live=False, model_provider="meta", 
     if not shipped:
         digest = await asyncio.to_thread(video_sha256, path)
         directory = cache.directory / "videos"
-        target = directory / f"{digest}.mp4"
-        if not target.exists():
+        target = directory / f"{digest}-motion-v1.mp4"
+        window_path = target.with_suffix(".json")
+        if not target.exists() or not window_path.exists():
             directory.mkdir(parents=True, exist_ok=True)
+            window = await asyncio.to_thread(find_active_motion_window, path)
             with tempfile.TemporaryDirectory(dir=directory) as temporary:
                 normalized = Path(temporary) / "normalized.mp4"
                 if await asyncio.to_thread(is_normalized_video, path):
                     import shutil
                     await asyncio.to_thread(shutil.copyfile, path, normalized)
                 else:
-                    await asyncio.to_thread(normalize_video, path, normalized)
+                    await asyncio.to_thread(normalize_video, path, normalized, trim_window_seconds=window)
                 normalized.replace(target)
+                sidecar = Path(temporary) / "window.json"
+                sidecar.write_text(json.dumps(list(window)))
+                sidecar.replace(window_path)
+        if trim_window_seconds is None:
+            trim_window_seconds = json.loads(window_path.read_text())
         path = target
         video_url = f"/analysis_videos/{target.name}"
     if (regime is None) != (object_prompt is None):
@@ -306,6 +314,9 @@ async def analyze_video(video_path, *, force_live=False, model_provider="meta", 
                                   cache=cache, regime=regime, object_prompt=object_prompt)
     metrics = calibrate_physical_metrics(result, known_object_width_cm, known_length_cm)
     return {**result, "inferred_physical_metrics": metrics,
+            "video_metadata": {**result.get("video_metadata", {}),
+                               **({"trim_window_seconds": list(trim_window_seconds)}
+                                  if trim_window_seconds is not None else {})},
             **({"video_url": video_url} if video_url else {})}
 
 
@@ -324,7 +335,7 @@ async def _analyze_video(video_path, *, force_live=False, model_provider="meta",
             entry = {}
         if model_provider in entry.get("analyses", {}):
             stored = entry["analyses"][model_provider]
-            if stored.get("fit_version") != 2 and "masks" in entry:
+            if stored.get("fit_version") != 3 and "masks" in entry:
                 # Upgrade legacy cached fits locally, using the hardened tracking path.
                 evidence = await asyncio.to_thread(fit_observations, _decode_masks(entry["masks"]),
                                                    entry["video_metadata"], entry["grounding"]["regime"])
