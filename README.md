@@ -28,3 +28,10 @@ for bounces. Slider parameters include `g_scale`, `gamma`, and `e`.
 The response contains `trajectory_points` and `phase_space` (position, velocity).
 
 Run offline verification with `.venv/bin/python -m pytest`.
+
+The React scientific workbench lives in `frontend/`. Start it with
+`cd frontend`, `npm install`, then `npm run dev` and open http://localhost:5173
+while the API is running. Select a demo or upload an MP4 and click
+**Analyze motion**. See [frontend/README.md](frontend/README.md) for overlay,
+phase-space, counterfactual, and verification details. `npm run build` performs
+the frontend TypeScript check and production build.
