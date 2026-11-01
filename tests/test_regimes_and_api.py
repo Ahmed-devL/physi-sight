@@ -185,7 +185,8 @@ def test_demo_static_analysis_upload_and_errors(tmp_path, monkeypatch):
     client = TestClient(api.app)
     listing = client.get("/api/demos")
     assert listing.status_code == 200
-    assert len(listing.json()["clips"]) == 3
+    assert {"damped_pendulum.mp4", "falling_drag_sphere.mp4", "bouncing_ball.mp4"} <= {
+        clip["clip_name"] for clip in listing.json()["clips"]}
     assert client.get(listing.json()["clips"][0]["url"]).status_code == 200
     captured = []
     async def fake_analyze(path, **kwargs):
@@ -296,3 +297,86 @@ def test_baseten_configuration(monkeypatch):
     assert model == "meta-models/muse-spark-open-1026"
     assert client is constructor.return_value
     assert constructor.call_args.kwargs["base_url"] == "https://example.test/v1"
+
+
+def test_pendulum_release_window_and_camera_tilt():
+    times = np.arange(138) / 30
+    active = times[18:] - times[18]
+    clean = integrate(active, ("sin_position", "velocity"), (-19.62, -.25),
+                      (.95, .025), theta_eq=.05)
+    raw = np.r_[np.full(18, clean[0]), clean]
+    raw += np.random.default_rng(42).normal(0, .003, len(raw))
+    best = next(r for r in fit_trajectory(times, raw, noise_scale=.003)
+                if not r.name.startswith(("sparse_", "polynomial")))
+    assert 16 <= best.release_index <= 24
+    assert best.name == "nonlinear_pendulum"
+    assert best.heldout_r2 > .98
+    assert best.omega0_squared == pytest.approx(19.62, rel=.03)
+    assert best.gamma == pytest.approx(.25, rel=.03)
+    assert best.coefficients["theta_eq"] == pytest.approx(.05, abs=.005)
+    assert best.train_size == int(.7 * (len(raw) - best.release_index))
+    assert len(best.prediction) == len(raw)
+    np.testing.assert_array_equal(best.prediction[:best.release_index], raw[:best.release_index])
+    changed = raw.copy()
+    changed[best.release_index + best.train_size:] += 10
+    after = next(r for r in fit_trajectory(times, changed, noise_scale=.003)
+                 if r.name == best.name)
+    assert best.release_index == after.release_index
+    assert best.coefficients == after.coefficients
+    np.testing.assert_array_equal(best.prediction[best.release_index:], after.prediction[after.release_index:])
+
+
+@pytest.mark.parametrize("regime", ["drag_fall", "bouncing_ball"])
+def test_stationary_hold_before_fall(regime):
+    t = np.arange(138) / 30
+    active = t[18:] - t[18]
+    clean = (_independent_ballistic(active) if regime == "bouncing_ball" else
+             integrate(active, ("constant", "quadratic_drag"), (-255.06, -.025), (467, 0)))
+    raw = np.r_[np.full(18, clean[0]), clean]
+    best = fit_trajectory(t, raw, regime=regime, noise_scale=.05)[0]
+    assert 16 <= best.release_index <= 24
+    assert best.heldout_r2 > .99
+
+
+def test_upload_returns_playable_normalized_video(monkeypatch):
+    async def fake_pipeline(path, **kwargs):
+        assert Path(path).exists()
+        return {"regime": "pendulum", "discovered_params": {"omega0_squared": 19.62},
+                "pivot_or_bounds": {"radius": 280}, "inferred_physical_metrics": {}}
+    monkeypatch.setattr(agent, "_analyze_video", fake_pipeline)
+    client = TestClient(api.app)
+    with (api.DEMO_DIR / "damped_pendulum.mp4").open("rb") as source:
+        response = client.post("/api/analyze/upload", files={"file": ("custom.mp4", source, "video/mp4")})
+    assert response.status_code == 200, response.text
+    url = response.json()["video_url"]
+    assert url.startswith("/analysis_videos/")
+    assert client.get(url).status_code == 200
+    assert response.json()["inferred_physical_metrics"]["L_meters"] == pytest.approx(.5)
+
+
+def test_agent_release_marks_full_track_and_anchors_counterfactual():
+    times = np.arange(138) / 30
+    clean = integrate(times[18:] - times[18], ("sin_position", "velocity"),
+                      (-19.62, -.25), (.95, .025), theta_eq=.05)
+    angles = np.r_[np.full(18, clean[0]), clean]
+    masks = [MaskMoments("1", i, (0, 0, 0, 0), np.ones((1, 1), dtype=np.uint8),
+                         1, float(256 + 180*np.sin(theta)),
+                         float(48 + 180*np.cos(theta)), None, 0, 0, 0)
+             for i, theta in enumerate(angles)]
+    result = agent.fit_observations(masks, {"fps": 30, "frames": 138, "height": 512,
+                                           "timestamps": times.tolist()}, "pendulum")
+    release = result["release_frame_idx"]
+    points = result["trajectory_points"]
+    assert 16 <= release <= 24
+    assert len(points) == 138
+    assert sum(p["is_pre_release"] for p in points) == release
+    assert sum(p["is_heldout"] for p in points) == 138 - release - int(.7 * (138 - release))
+    assert result["heldout_r2"] > .98
+    response = TestClient(api.app).post("/api/counterfactual", json={
+        "regime": "pendulum", "params": result["discovered_params"],
+        "initial_state": result["initial_state"], "pivot_or_bounds": result["pivot_or_bounds"],
+        "frames": 138, "fps": 30})
+    assert response.status_code == 200, response.text
+    predicted = response.json()["trajectory_points"]
+    np.testing.assert_allclose([p["pred_y_px"] for p in predicted[release:]],
+                               [p["pred_y_px"] for p in points[release:]], atol=.001)

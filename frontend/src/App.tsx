@@ -6,6 +6,7 @@ import katex from 'katex';
 import { API, assetURL, clipLabel, defaults, format, observationStart, request, simulate } from './api';
 import type { Analysis, Controls, Demo, Provider, Simulation } from './api';
 import { Overlay, PhasePortrait } from './Plots';
+import { Calibration, Exports } from './Calibration';
 import type { Layers } from './Plots';
 
 type Source = { url: string; label: string; clip?: string; file?: File };
@@ -48,6 +49,7 @@ function Slider({ label, value, min = 0, max, step, unit, disabled, onChange }: 
 export default function App() {
   const [demos, setDemos] = useState<Demo[]>([]);
   const [source, setSource] = useState<Source | null>(null);
+  const [analyzedVideoURL, setAnalyzedVideoURL] = useState<string | null>(null);
   const [provider, setProvider] = useState<Provider>('meta');
   const [forceLive, setForceLive] = useState(false);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
@@ -89,7 +91,7 @@ export default function App() {
 
   useEffect(() => {
     analysisRequest.current?.abort();
-    setAnalysis(null); setBaseline(null); setSimulation(null); setLoading(false);
+    setAnalysis(null); setAnalyzedVideoURL(null); setBaseline(null); setSimulation(null); setLoading(false);
     setError(''); setSimulationError(''); setLatency(null);
     return () => analysisRequest.current?.abort();
   }, [source, provider]);
@@ -177,7 +179,11 @@ export default function App() {
       if (body && source.file) body.append('file', source.file);
       const endpoint = source.file ? '/api/analyze/upload' : `/api/analyze/demo/${encodeURIComponent(source.clip!)}`;
       const result = await request<Analysis>(endpoint + query, { method: 'POST', body, signal: controller.signal });
-      if (!controller.signal.aborted) setAnalysis(result);
+      if (!controller.signal.aborted) {
+        setAnalyzedVideoURL(result.video_url ? assetURL(result.video_url) : source.url);
+        setTime(0); setPlaying(false); setVideoError('');
+        setAnalysis(result);
+      }
     } catch (e) { if (!controller.signal.aborted) setError(errorMessage(e)); }
     finally { if (!controller.signal.aborted) setLoading(false); }
   }
@@ -220,14 +226,14 @@ export default function App() {
   const splitPercent = duration && splitTime != null ? Math.min(100, splitTime / duration * 100) : 70;
   const metadata = analysis?.video_metadata;
   const frameIndex = metadata ? Math.max(0, metadata.timestamps.filter(t => t <= time + 0.0001).length - 1) : null;
-  const ghostChanged = analysis && (controls.gravity !== 9.81 || controls.damping !== defaults(analysis).damping || controls.restitution !== defaults(analysis).restitution);
+  const ghostChanged = analysis && (controls.gravity !== defaults(analysis).gravity || controls.damping !== defaults(analysis).damping || controls.restitution !== defaults(analysis).restitution);
 
   return <div className="app-shell">
     <header ref={headerRef} className="topbar"><div className="topbar-inner">
       <div className="nav-main"><a href="#" className="wordmark" aria-label="PhysiSight home"><span className="brand-icon"><Activity size={28} strokeWidth={1.5} /></span><span>PhysiSight<small>A field guide to physical laws</small></span></a>
       <div className="experiment-bar" aria-label="Experiment configuration">
         <div className="clip-select"><label htmlFor="demo">EXPERIMENT</label><div><FlaskConical size={16} /><select id="demo" value={source?.clip ?? ''} onChange={e => chooseDemo(e.target.value)} disabled={!demos.length}>
-          {!source?.clip && <option value="">{source?.file ? 'Custom MP4' : fetchingDemos ? 'Connecting to API…' : 'No demo selected'}</option>}
+          {!source?.clip && <option value="">{source?.file ? source.label : fetchingDemos ? 'Connecting to API…' : 'No demo selected'}</option>}
           {demos.map(d => <option key={d.clip_name} value={d.clip_name}>{clipLabel(d.regime)}</option>)}
         </select><ChevronDown size={13} /></div></div>
         <button className="upload-button" onClick={() => uploadRef.current?.click()}><Upload size={14} />Upload MP4</button>
@@ -239,18 +245,18 @@ export default function App() {
     </div></header>
     <main>
       <div className="page-heading"><div className="eyebrow"><span className="status-dot" /> THE COMPUTATIONAL FIELD NOTES / VOL. 01</div><h1>Every motion<br />tells <em>a story.</em></h1><p>Find the physical law hiding in a few seconds of video.<br className="desktop-break" /> Then change the world, and see what happens next.</p><span className="heading-index">FROM PIXELS TO PRINCIPLES <ArrowRight size={20} /></span></div>
-      <div className="analysis-settings" aria-label="Analysis settings">        <div className="provider-field"><label htmlFor="provider">MODEL PROVIDER</label><select id="provider" value={provider} onChange={e => setProvider(e.target.value as Provider)}><option value="meta">Meta Muse Wonder 1.0</option><option value="baseten">Muse Spark Open · Baseten</option></select><span>SAM 3.1 / Muse Spark 1.3</span></div>
+      <div className="analysis-settings" aria-label="Analysis settings">        <div className="provider-field"><label htmlFor="provider">MODEL PROVIDER</label><select id="provider" value={provider} onChange={e => setProvider(e.target.value as Provider)}><option value="meta">Meta Muse Wonder 1.0</option></select><span>SAM 3.1 / Muse Spark 1.3</span></div>
         <label className="live-toggle"><input type="checkbox" checked={forceLive} onChange={e => setForceLive(e.target.checked)} /><span className="switch" /><span>Force Live API Re-run</span></label>
 </div>
       {error && <div role="alert" className="error-banner">{error}<button onClick={() => source ? void analyze() : setDemoRetry(n => n + 1)}>Retry</button></div>}
-      {loading && <div role="status" className="progress-banner"><LoaderCircle size={15} className="spin" /><span>Analyzing {source?.label}: grounding → SAM tracking → trajectory shooting → symbolic review. {forceLive ? 'Live API re-run requested.' : 'Checking the analysis cache first.'}</span><button onClick={() => { analysisRequest.current?.abort(); setLoading(false); }}>Cancel</button></div>}
+      {loading && <div role="status" className="progress-banner"><LoaderCircle size={15} className="spin" /><span>Analyzing video with SAM 3.1 &amp; ODE Solver... {source?.label} {forceLive ? 'Live API re-run requested.' : 'Checking the analysis cache first.'}</span><button onClick={() => { analysisRequest.current?.abort(); setLoading(false); }}>Cancel</button></div>}
 
       <div className="workbench">
         <section id="observation" data-chapter className="panel chapter studio-section"><div className="panel-header"><div><span className="section-number">01</span><h2>Observation &amp; counterfactual studio</h2></div><span className="micro-label">ONE EXPERIMENT. OTHER WORLDS.</span></div><p className="section-intro">Watch what is. Wonder what could be. Change gravity or damping and follow the ghost into a different world.</p><div className="studio-grid"><div className="observation-column">          <div className="observation-panel">
             <div className="panel-header"><div><h3>Observation field</h3></div><span className="micro-label"><span className={`status-dot ${analysis ? '' : 'idle'}`} />{analysis ? 'TRACK REGISTERED' : 'AWAITING ANALYSIS'}</span></div>
             <div className="video-metadata"><span><ScanLine size={12} />{source?.label ?? 'No video selected'}</span><span>{metadata ? `${metadata.width} × ${metadata.height} / ${format(metadata.fps, 2)} FPS` : 'SOURCE VIDEO'}</span></div>
             <div className="video-viewport"><div className="video-stage" style={{ width: `min(100%, ${540 * (metadata ? metadata.width / metadata.height : videoSize.width / videoSize.height)}px)`, aspectRatio: metadata ? `${metadata.width} / ${metadata.height}` : `${videoSize.width} / ${videoSize.height}` }}>
-              {source ? <video key={source.url} ref={videoRef} src={source.url} playsInline preload="metadata"
+              {source ? <video key={analyzedVideoURL ?? source.url} ref={videoRef} src={analyzedVideoURL ?? source.url} playsInline preload="metadata"
                 className={layers.background && analysis?.background_image ? 'video-hidden' : ''}
                 onLoadedMetadata={e => { setDuration(e.currentTarget.duration); setVideoSize({ width: e.currentTarget.videoWidth || 16, height: e.currentTarget.videoHeight || 10 }); }} onDurationChange={e => { if (Number.isFinite(e.currentTarget.duration)) setDuration(e.currentTarget.duration); }}
                 onTimeUpdate={e => setTime(e.currentTarget.currentTime)} onSeeked={e => setTime(e.currentTarget.currentTime)}
@@ -262,16 +268,16 @@ export default function App() {
               <Overlay analysis={analysis} simulation={simulation} layers={layers} videoRef={videoRef} />
               <span className="field-corner top-left" /><span className="field-corner bottom-right" />
               <div className="field-label">{layers.background && analysis ? 'MEDIAN BACKGROUND' : 'CAM 01 / SOURCE'}<span>{analysis ? analysis.object_prompt.toUpperCase() : 'UNPROCESSED'}</span></div>
-              {analysis && <span className={`field-state ${time >= (splitTime ?? Infinity) ? 'heldout' : ''}`}>{time >= (splitTime ?? Infinity) ? 'HELD-OUT / FORECAST' : 'TRAINING / OBSERVED'}</span>}
+              {analysis && <span className={`field-state ${time >= (splitTime ?? Infinity) ? 'heldout' : ''}`}>{time < observationStart(analysis) + (analysis.release_time ?? 0) ? 'PRE-RELEASE / OBSERVED' : time >= (splitTime ?? Infinity) ? 'HELD-OUT / FORECAST' : 'TRAINING / FREE MOTION'}</span>}
             </div>
             </div>
             {videoError && <p role="alert" className="inline-error">{videoError}</p>}
             <div className="transport"><button className="play-button" aria-label={playing ? 'Pause video' : 'Play video'} disabled={!source} onClick={() => void togglePlayback()}>{playing ? <Pause size={17} /> : <Play size={17} />}</button><button title="Previous frame" aria-label="Previous frame" disabled={!source} onClick={() => step(-1)}><SkipBack size={14} /></button><button title="Next frame" aria-label="Next frame" disabled={!source} onClick={() => step(1)}><SkipForward size={14} /></button><span className="timecode">{format(time, 2)} <span>/ {format(duration, 2)} s</span></span><span className="frame-label">FRAME {frameIndex == null ? '—' : String(frameIndex).padStart(4, '0')}</span></div>
             <div className="timeline-wrap"><div className="timeline-colors" style={{ background: `linear-gradient(to right, #D79921 0%, #D79921 ${splitPercent}%, #687D31 ${splitPercent}%, #687D31 100%)` }} /><input aria-label="Video playhead in seconds" type="range" min={0} max={duration || 1} step={0.001} value={Math.min(time, duration || 1)} disabled={!duration} onChange={e => seek(Number(e.target.value))} /><span className="split-marker" style={{ left: `${splitPercent}%` }} /></div>
-            <div className="timeline-labels"><span><i className="legend-dot cream" />70% TRAINING</span><span>CHRONOLOGICAL SPLIT</span><span><i className="legend-dot sage" />30% HELD-OUT FORECAST</span></div>
+            <div className="timeline-labels"><span><i className="legend-dot cream" />70% FREE-MOTION TRAINING</span><span>CHRONOLOGICAL SPLIT</span><span><i className="legend-dot sage" />30% HELD-OUT FORECAST</span></div>
             <div className="layer-controls"><div className="micro-label"><Layers3 size={13} /> OVERLAY CHANNELS</div><div className="layer-grid"><Toggle active={layers.tracked} onClick={() => toggleLayer('tracked')}>Show Tracked Centroids</Toggle><Toggle active={layers.forecast} onClick={() => toggleLayer('forecast')}>Show 30% Held-Out Forecast</Toggle><Toggle active={layers.ghost} onClick={() => toggleLayer('ghost')}>Show Counterfactual Ghost</Toggle><Toggle active={layers.background} disabled={!analysis?.background_image} onClick={() => toggleLayer('background')}>Show Clean Median Background</Toggle></div></div>
           </div>
-          <div className="observation-note"><CircleDot size={16} /><p>{analysis ? <>Forecasts start at the last training observation. <strong>The final 30% is never used for fitting.</strong> Amber points are SAM centroids; olive is the held-out model forecast.</> : <>The video is the experiment. <strong>Analyze motion to extract its governing law.</strong> Only backend measurements and model results appear here.</>}</p></div>
+          <div className="observation-note"><CircleDot size={16} /><p>{analysis ? <>The model starts at the detected release; forecasts follow the free-motion training window. <strong>The final 30% is never used for fitting.</strong> Amber points are SAM centroids; olive is the held-out model forecast.</> : <>The video is the experiment. <strong>Analyze motion to extract its governing law.</strong> Only backend measurements and model results appear here.</>}</p></div>
 
 </div>          <section className="panel counterfactual-panel"><div className="panel-header"><div><span className="world-icon">✳</span><h3>A different world</h3></div><button className="reset-button" disabled={!analysis || !baseline} onClick={() => analysis && setControls(defaults(analysis))}><RotateCcw size={12} />Reset</button></div><p className="counterfactual-intro">Change the physics. Watch the ghost diverge.</p><div className="planet-presets">{planets.map(([name, gravity]) => <button key={name} disabled={!baseline} aria-pressed={Math.abs(controls.gravity - gravity) < 0.001} className={Math.abs(controls.gravity - gravity) < 0.001 ? 'active' : ''} onClick={() => update('gravity', gravity)}><span>{name}</span><small>{gravity.toFixed(2)}</small></button>)}</div>
             <Slider label="Gravity g" value={controls.gravity} min={0.1} max={30} step={0.01} unit="m/s²" disabled={!baseline} onChange={value => update('gravity', value)} />
@@ -282,7 +288,7 @@ export default function App() {
           </section>
 </div></section>
           <section id="law" data-chapter className="panel chapter equation-panel"><div className="panel-header"><div><span className="section-number">02</span><h2>Discovered governing law</h2></div><span className={`result-status ${analysis ? 'verified' : ''}`}>{analysis ? <><Check size={12} />FITTED</> : 'PENDING'}</span></div>
-            {analysis ? <><div className="law-name"><span>{pretty(analysis.selected_candidate)}</span><span>{analysis.cache_hit ? 'CACHED ANALYSIS' : 'LIVE ANALYSIS'}</span></div><Equation latex={analysis.latex_equation} /><p className="interpretation">{analysis.plain_english_explanation}</p><div className="physical-metrics">{Object.entries(analysis.inferred_physical_metrics).map(([key, value]) => <div key={key}><span>{({ L_meters: 'STRING LENGTH L', calibration_gravity_m_s2: 'CALIBRATION g (m/s²)', pixels_per_meter: 'SCALE (px/m)', restitution_e: 'RESTITUTION e', g_pixels: 'GRAVITY (px/s²)' } as Record<string, string>)[key] ?? pretty(key)}</span><strong>{format(value)}{key === 'L_meters' ? ' m' : ''}</strong></div>)}{analysis.regime === 'pendulum' && <div><span>DAMPING RATIO ζ</span><strong>{format(analysis.discovered_params.gamma / (2 * Math.sqrt(analysis.discovered_params.omega0_squared)))}</strong></div>}</div><div className="score-grid"><div><span>TRAIN R²</span><strong>{format(analysis.train_r2, 4)}</strong><small>First 70%</small></div><div className="sage-score"><span>HELD-OUT R²</span><strong>{format(analysis.heldout_r2, 4)}</strong><small>Final 30% · forecast</small></div><div className="sage-score"><span>HELD-OUT RMSE</span><strong>{format(analysis.heldout_rmse, 4)}</strong><small>{analysis.metric_units}</small></div><div><span>{analysis.regime === 'pendulum' ? 'INFERRED LENGTH' : analysis.regime === 'bouncing_ball' ? 'RESTITUTION e' : 'CALIBRATION GRAVITY'}</span><strong>{format(analysis.regime === 'pendulum' ? analysis.inferred_physical_metrics.L_meters : analysis.regime === 'bouncing_ball' ? analysis.discovered_params.e : 9.81, 3)}</strong><small>{analysis.regime === 'pendulum' ? 'meters · Earth gravity assumed' : analysis.regime === 'bouncing_ball' ? 'Velocity retained at impact' : 'm/s² · assumed for scale'}</small></div></div><p className="calibration-note">{analysis.regime === 'pendulum' ? 'Length inferred assuming Earth gravity (9.81 m/s²).' : analysis.regime === 'drag_fall' ? 'Known Earth gravity sets the pixel-to-meter scale.' : 'Gravity is fitted in pixel units; SI scale is not independently measured.'}</p></>
+            {analysis ? <><div className="law-name"><span>{pretty(analysis.selected_candidate)}</span><span>{analysis.cache_hit ? 'CACHED ANALYSIS' : 'LIVE ANALYSIS'}</span></div><Equation latex={analysis.latex_equation} /><p className="interpretation">{analysis.plain_english_explanation}</p><div className="physical-metrics">{Object.entries(analysis.inferred_physical_metrics).map(([key, value]) => <div key={key}><span>{({ L_meters: 'STRING LENGTH L', calibration_gravity_m_s2: 'CALIBRATION g (m/s²)', pixels_per_meter: 'SCALE (px/m)', restitution_e: 'RESTITUTION e', g_pixels: 'GRAVITY (px/s²)' } as Record<string, string>)[key] ?? pretty(key)}</span><strong>{format(value)}{key === 'L_meters' ? ' m' : ''}</strong></div>)}{analysis.regime === 'pendulum' && <div><span>DAMPING RATIO ζ</span><strong>{format(analysis.discovered_params.gamma / (2 * Math.sqrt(analysis.discovered_params.omega0_squared)))}</strong></div>}</div><div className="score-grid"><div><span>TRAIN R²</span><strong>{format(analysis.train_r2, 4)}</strong><small>First 70%</small></div><div className="sage-score"><span>HELD-OUT R²</span><strong>{format(analysis.heldout_r2, 4)}</strong><small>Final 30% · forecast</small></div><div className="sage-score"><span>HELD-OUT RMSE</span><strong>{format(analysis.heldout_rmse, 4)}</strong><small>{analysis.metric_units}</small></div><div><span>{analysis.regime === 'pendulum' ? 'INFERRED LENGTH' : analysis.regime === 'bouncing_ball' ? 'RESTITUTION e' : analysis.inferred_physical_metrics.g_measured_m_s2 != null ? 'MEASURED GRAVITY' : 'CALIBRATION GRAVITY'}</span><strong>{format(analysis.regime === 'pendulum' ? analysis.inferred_physical_metrics.L_meters : analysis.regime === 'bouncing_ball' ? analysis.discovered_params.e : analysis.inferred_physical_metrics.g_measured_m_s2 ?? 9.81, 3)}</strong><small>{analysis.regime === 'pendulum' ? analysis.inferred_physical_metrics.g_measured_m_s2 != null ? 'meters · independent scale' : 'meters · Earth gravity assumed' : analysis.regime === 'bouncing_ball' ? 'Velocity retained at impact' : analysis.inferred_physical_metrics.g_measured_m_s2 != null ? 'm/s² · independent scale' : 'm/s² · assumed for scale'}</small></div></div><p className="calibration-note">{analysis.inferred_physical_metrics.g_measured_m_s2 != null ? 'Gravity measured using an independently supplied length scale.' : analysis.regime === 'pendulum' ? 'Length inferred assuming Earth gravity (9.81 m/s²).' : analysis.regime === 'drag_fall' ? 'Known Earth gravity sets the pixel-to-meter scale.' : 'Gravity is fitted in pixel units; SI scale is not independently measured.'}</p><Calibration key={analysis.video_sha256} analysis={analysis} onMetrics={metrics => setAnalysis(previous => previous ? { ...previous, inferred_physical_metrics: metrics } : previous)} /><Exports analysis={analysis} /></>
               : <div className="empty-law"><Workflow size={30} strokeWidth={1} /><span>{loading ? 'Searching for a physical explanation…' : 'A physical law, waiting to be discovered.'}</span><p>Run an analysis to inspect the equation, inferred parameters, and forecast accuracy.</p></div>}
           </section>
 <section id="hypotheses" data-chapter className="panel chapter hypotheses-panel">

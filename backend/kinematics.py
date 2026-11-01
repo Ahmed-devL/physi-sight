@@ -7,6 +7,9 @@ import meta_sam_parser as sam
 import numpy as np
 from scipy.interpolate import CubicSpline
 import cv2
+import json
+from pathlib import Path
+import subprocess
 
 
 @dataclass(frozen=True)
@@ -119,6 +122,22 @@ def interpolate_trajectory(masks, fps, frame_height) -> dict[str, Trajectory]:
         frames = np.array(sorted(track), dtype=int)
         grid = np.arange(frames[0], frames[-1] + 1)
         values = np.array([track[frame] for frame in frames])
+        if len(frames) >= 5:
+            # A spike has two large adjacent jumps and returns to the local path.
+            # Divide by frame gaps so missing detections do not inflate the step.
+            steps = np.linalg.norm(np.diff(values, axis=0), axis=1) / np.diff(frames)
+            median = float(np.median(steps))
+            threshold = 3.5 * max(median, 1e-6)
+            reject = []
+            for i in range(1, len(frames) - 1):
+                if frames[i] - frames[i-1] != 1 or frames[i+1] - frames[i] != 1:
+                    continue
+                bridge = np.linalg.norm(values[i+1] - values[i-1]) / 2
+                if steps[i-1] > threshold and steps[i] > threshold and bridge <= threshold:
+                    reject.append(i)
+            if reject:
+                frames = np.delete(frames, reject)
+                values = np.delete(values, reject, axis=0)
         coordinates = (CubicSpline(frames / fps, values, axis=0)(grid / fps)
                        if len(frames) > 1 else values)
         result[object_id] = Trajectory(
@@ -190,3 +209,112 @@ def extract_median_background(video_path) -> np.ndarray:
         return np.median(frames, axis=0).astype(np.uint8)
     finally:
         capture.release()
+
+
+def select_primary_track(tracks):
+    """Prefer valid coverage, then moving rather than stationary detections."""
+    if not tracks:
+        raise ValueError("SAM returned no nonempty tracks")
+    # Exclude stationary background detections when a resolved moving track exists.
+    moving = [tr for tr in tracks.values() if np.var(tr.x[tr.observed])
+              + np.var(tr.y_phys[tr.observed]) > 1.0]
+    return max(moving or tracks.values(), key=lambda tr: (
+        int(np.sum(tr.observed)),
+        float(np.var(tr.x[tr.observed]) + np.var(tr.y_phys[tr.observed])),
+        str(tr.object_id),
+    ))
+
+
+def mask_size_metrics(masks, track):
+    valid_frames = set(track.frame_indices[track.observed].tolist())
+    selected = [m for m in masks if m.object_id == track.object_id
+                and m.frame_index in valid_frames and m.area > 0]
+    return {
+        "median_box_width_px": float(np.median([m.box[2] - m.box[0] + 1 for m in selected])),
+        "median_box_height_px": float(np.median([m.box[3] - m.box[1] + 1 for m in selected])),
+        "median_area_px2": float(np.median([m.area for m in selected])),
+        "equiv_diameter_px": float(2 * np.sqrt(np.median([m.area for m in selected]) / np.pi)),
+    }
+
+
+def normalize_video(input_path, output_path):
+    """Normalize VFR/phone video, including rotation, to at most five seconds."""
+    source, target = Path(input_path), Path(output_path)
+    if source.resolve() == target.resolve():
+        raise ValueError("Normalization requires a separate output path")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run([
+            "ffmpeg", "-y", "-i", str(source), "-t", "5.0",
+            "-vf", "fps=30,scale=-2:720", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart", "-an", str(target),
+        ], check=True, capture_output=True)
+    except FileNotFoundError as error:
+        raise RuntimeError("ffmpeg is required for video normalization") from error
+    except subprocess.CalledProcessError as error:
+        raise ValueError("Video normalization failed; upload a decodable MP4") from error
+    return target
+
+
+def is_normalized_video(path):
+    """Check timestamps as well as nominal rate; average FPS alone misses VFR."""
+    try:
+        result = subprocess.run([
+            "ffprobe", "-v", "error", "-read_intervals", "%+6", "-select_streams", "v:0", "-show_streams",
+            "-show_frames", "-show_entries",
+            "stream=codec_name,pix_fmt,height:frame=best_effort_timestamp_time",
+            "-of", "json", str(path),
+        ], check=True, capture_output=True, text=True)
+        data = json.loads(result.stdout)
+        stream = data["streams"][0]
+        stamps = np.array([float(f["best_effort_timestamp_time"]) for f in data["frames"]])
+        return (stream["codec_name"] == "h264" and stream["pix_fmt"] == "yuv420p"
+                and stream["height"] == 720 and 20 <= len(stamps) <= 150
+                and abs(stamps[0]) < 1e-4 and np.allclose(np.diff(stamps), 1/30, atol=2e-5))
+    except (OSError, subprocess.CalledProcessError, ValueError, KeyError, IndexError):
+        return False
+
+
+def detect_release_index(times, observations, *, regime, noise_scale=0.015):
+    """Find an initial hold or hand-driven approach to a release extremum.
+
+    Inspect only the first 60% (strictly inside any subsequent training
+    window). Require sustained displacement beyond tracking noise. A clip
+    already moving freely keeps its first sample. Return an observation index,
+    not a video frame number; callers map through the explicit frame indices.
+    """
+    from scipy.signal import savgol_filter, find_peaks
+
+    y = np.asarray(observations, dtype=float)
+    if regime not in ("pendulum", "drag", "drag_fall", "bouncing_ball"):
+        return 0
+    t = np.asarray(times, dtype=float)
+    prefix = y[:int(len(y) * 0.6)]
+    if len(prefix) < 10:
+        return 0
+    span = float(np.ptp(prefix))
+    threshold = max(4 * noise_scale, .005 * span)
+    baseline = float(np.median(prefix[:8]))
+    release = 0
+    if np.ptp(prefix[:8]) < max(6 * noise_scale, .002 * span):
+        moving = np.abs(prefix - baseline) > threshold
+        for i in range(8, len(prefix) - 2):
+            if np.all(moving[i:i+3]):
+                # Retain the transition shoulder; shooting refines its state.
+                release = max(0, i - 2)
+                break
+    if regime == "pendulum":
+        smooth = savgol_filter(prefix, 5, 2)
+        # A significant initial rise/fall followed by a reversal indicates
+        # hand positioning before release. Do not skip an ordinary first
+        # half-cycle when the clip already starts at its release extremum.
+        peaks = sorted([*find_peaks(smooth)[0], *find_peaks(-smooth)[0]])
+        for peak in peaks:
+            if peak < 2 or peak > len(prefix) // 2 or t[peak] - t[release] > 0.2:
+                continue
+            approach = smooth[peak] - smooth[0]
+            reversal = smooth[peak] - smooth[min(len(prefix)-1, peak+4)]
+            if abs(approach) > max(2 * noise_scale, .025 * span) and approach * reversal > 0 and abs(reversal) > threshold:
+                return int(peak)
+            break
+    return release

@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import weakref
+import tempfile
 
 import cv2
 from dotenv import load_dotenv
@@ -20,8 +21,9 @@ from backend.cache import DiskCache, video_sha256
 from backend.kinematics import (
     MaskMoments, extract_median_background, fit_pendulum_pivot,
     infer_pendulum_length, interpolate_trajectory, parse_sam_video,
+    select_primary_track, mask_size_metrics, normalize_video, is_normalized_video, detect_release_index,
 )
-from backend.solver import fit_trajectory
+from backend.solver import fit_trajectory, calibrate_physical_metrics
 
 ROOT = Path(__file__).resolve().parents[1]
 REGIMES = {"pendulum", "drag_fall", "bouncing_ball"}
@@ -155,8 +157,7 @@ def fit_observations(masks, metadata, regime):
     tracks = interpolate_trajectory(masks, metadata["fps"], metadata["height"])
     if not tracks:
         raise ValueError("SAM returned no nonempty tracks")
-    boundary = int(metadata["frames"] * 0.7)
-    track = max(tracks.values(), key=lambda tr: np.sum(tr.observed & (tr.frame_indices < boundary)))
+    track = select_primary_track(tracks)
     indices = track.frame_indices[track.observed]
     if len(indices) < 20 or indices[-1] >= metadata["frames"]:
         raise ValueError("Insufficient or invalid tracked observations")
@@ -173,8 +174,19 @@ def fit_observations(masks, metadata, regime):
         values = y
         horizontal = np.polyfit(times[:split], x[:split], 1)
         geometry.update(x0=float(horizontal[1]), vx=float(horizontal[0]))
-    results = fit_trajectory(times, values, regime=regime,
-                             noise_scale=0.015 if regime == "pendulum" else 0.5)
+    noise = 0.015 if regime == "pendulum" else 0.5
+    release = detect_release_index(times, values, regime=regime, noise_scale=noise)
+    split = release + int((len(times) - release) * 0.7)
+    if regime == "pendulum":
+        pivot = fit_pendulum_pivot(x[release:split], y[release:split])
+        values = pivot.angles(x, y)
+        geometry.update(x0=pivot.x0, y0=pivot.y0, radius=pivot.L_pixels)
+    else:
+        horizontal = np.polyfit(times[release:split], x[release:split], 1)
+        geometry.update(x0=float(horizontal[1]), vx=float(horizontal[0]))
+    geometry["release_time"] = float(times[release])
+    results = fit_trajectory(times, values, regime=regime, noise_scale=noise,
+                             release_index=release)
     # A polynomial is a diagnostic baseline, never a discovered physical law.
     physical = [r for r in results if not r.name.startswith(("polynomial", "sparse_"))]
     best = min(physical, key=lambda r: r.bic)
@@ -183,12 +195,12 @@ def fit_observations(masks, metadata, regime):
     if regime == "pendulum":
         omega2 = -params.get("sin_position", params.get("position", 0))
         params = {"omega0_squared": omega2, "gamma": -params.get("velocity", 0),
-                  "linear": int("sin_position" not in params)}
+                  "linear": int("sin_position" not in params), "theta_eq": params.get("theta_eq", 0.0)}
         metrics = {"L_meters": infer_pendulum_length(omega2), "calibration_gravity_m_s2": 9.81}
         px = geometry["x0"] + geometry["radius"] * np.sin(best.prediction)
         py = metadata["height"] - geometry["y0"] + geometry["radius"] * np.cos(best.prediction)
-        equation = (r"\ddot{\theta}+\gamma\dot{\theta}+\frac{g}{L}\sin(\theta)=0"
-                    if not params["linear"] else r"\ddot{\theta}+\gamma\dot{\theta}+\frac{g}{L}\theta=0")
+        equation = (r"\ddot{\theta}+\gamma\dot{\theta}+\frac{g}{L}\sin(\theta-\theta_{eq})=0"
+                    if not params["linear"] else r"\ddot{\theta}+\gamma\dot{\theta}+\frac{g}{L}(\theta-\theta_{eq})=0")
     else:
         px = geometry["x0"] + geometry["vx"] * times
         py = metadata["height"] - best.prediction
@@ -202,24 +214,25 @@ def fit_observations(masks, metadata, regime):
             geometry["floor"] = params["floor"]
             metrics = {"g_pixels": params["g_pixels"], "restitution_e": params["e"]}
             equation = r"\ddot{y}=-g;\quad v^+=-e v^-\quad(y=y_{floor})"
-    residual = best.prediction[:split] - values[:split]
-    variance = float(np.sum((values[:split] - values[:split].mean())**2))
+    residual = best.prediction[release:split] - values[release:split]
+    variance = float(np.sum((values[release:split] - values[release:split].mean())**2))
     train_r2 = float(1 - np.sum(residual**2) / variance) if variance else 0.0
     table = [{"name": r.name, "bic": r.bic, "heldout_r2": _finite(r.heldout_r2),
               "heldout_rmse": r.heldout_rmse, "coefficients": r.coefficients,
               "selected": r.name == best.name} for r in results]
     points = [{"frame_idx": int(frame), "t": float(t), "x_px": float(xp),
                "y_px": float(metadata["height"] - yp), "pred_x_px": float(pred_x),
-               "pred_y_px": float(pred_y), "is_heldout": i >= split}
+               "pred_y_px": float(pred_y), "is_pre_release": i < release, "is_heldout": i >= split}
               for i, (frame, t, xp, yp, pred_x, pred_y) in
               enumerate(zip(indices, times, x, y, px, py))]
     return {"latex_equation": equation, "regime": regime, "discovered_params": params,
-            "inferred_physical_metrics": metrics, "train_r2": train_r2,
+            "inferred_physical_metrics": {**metrics, **mask_size_metrics(masks, track)}, "train_r2": train_r2,
             "heldout_r2": _finite(best.heldout_r2), "heldout_rmse": best.heldout_rmse,
             "metric_units": "radians" if regime == "pendulum" else "pixels",
             "candidate_comparison_table": table, "trajectory_points": points,
             "initial_state": list(best.initial_state), "pivot_or_bounds": geometry,
-            "selected_candidate": best.name}
+            "selected_candidate": best.name, "release_frame_idx": int(indices[release]),
+            "release_time": float(times[release]), "fit_version": 2}
 
 
 def _finite(value):
@@ -258,7 +271,46 @@ async def hypothesis_loop(evidence, model_provider):
     return steps
 
 
-async def analyze_video(video_path, *, force_live=False, model_provider="meta", cache=None):
+async def analyze_video(video_path, *, force_live=False, model_provider="meta", cache=None,
+                        known_object_width_cm=None, known_length_cm=None,
+                        regime=None, object_prompt=None):
+    cache = cache if cache is not None else DiskCache()
+    path = Path(video_path)
+    # Shipped Gate 0–4 clips are already CFR H.264 and keep their verified geometry.
+    shipped = path.resolve().parent == ROOT / "backend" / "demo_clips" and path.name in {
+        "damped_pendulum.mp4", "falling_drag_sphere.mp4", "bouncing_ball.mp4"}
+    video_url = None
+    if not shipped:
+        digest = await asyncio.to_thread(video_sha256, path)
+        directory = cache.directory / "videos"
+        target = directory / f"{digest}.mp4"
+        if not target.exists():
+            directory.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=directory) as temporary:
+                normalized = Path(temporary) / "normalized.mp4"
+                if await asyncio.to_thread(is_normalized_video, path):
+                    import shutil
+                    await asyncio.to_thread(shutil.copyfile, path, normalized)
+                else:
+                    await asyncio.to_thread(normalize_video, path, normalized)
+                normalized.replace(target)
+        path = target
+        video_url = f"/analysis_videos/{target.name}"
+    if (regime is None) != (object_prompt is None):
+        raise ValueError("Supply both regime and object_prompt")
+    if regime is not None and (regime not in REGIMES or not re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9 -]{0,79}", object_prompt) or re.search(
+            r"\b(and|or|segment|track|identify|please)\b", object_prompt, re.I)):
+        raise ValueError("Invalid regime or object noun phrase")
+    result = await _analyze_video(path, force_live=force_live, model_provider=model_provider,
+                                  cache=cache, regime=regime, object_prompt=object_prompt)
+    metrics = calibrate_physical_metrics(result, known_object_width_cm, known_length_cm)
+    return {**result, "inferred_physical_metrics": metrics,
+            **({"video_url": video_url} if video_url else {})}
+
+
+async def _analyze_video(video_path, *, force_live=False, model_provider="meta", cache=None,
+                         regime=None, object_prompt=None):
     if model_provider not in ("meta", "baseten"):
         raise ValueError("Unknown model provider")
     cache = cache if cache is not None else DiskCache()
@@ -268,8 +320,17 @@ async def analyze_video(video_path, *, force_live=False, model_provider="meta", 
     lock = _LOCKS.setdefault(lock_key, asyncio.Lock())
     async with lock:
         entry = {} if force_live else await asyncio.to_thread(cache.load, digest)
+        if regime is not None and entry.get("grounding") != {"regime": regime, "object_prompt": object_prompt}:
+            entry = {}
         if model_provider in entry.get("analyses", {}):
-            return {**entry["analyses"][model_provider], "cache_hit": True,
+            stored = entry["analyses"][model_provider]
+            if stored.get("fit_version") != 2 and "masks" in entry:
+                # Upgrade legacy cached fits locally, using the hardened tracking path.
+                evidence = await asyncio.to_thread(fit_observations, _decode_masks(entry["masks"]),
+                                                   entry["video_metadata"], entry["grounding"]["regime"])
+                stored = {**stored, **evidence}
+                await asyncio.to_thread(cache.update, digest, analyses={model_provider: stored})
+            return {**stored, "cache_hit": True,
                     "model_api_cost_usd": 0.0}
         if "masks" in entry and "grounding" in entry:
             grounding, metadata = entry["grounding"], entry["video_metadata"]
@@ -277,7 +338,8 @@ async def analyze_video(video_path, *, force_live=False, model_provider="meta", 
             background = entry["background_image"]
         else:
             metadata, keyframes = await asyncio.to_thread(_video_info, path)
-            grounding = await ground_scene(path, keyframes)
+            grounding = ({"regime": regime, "object_prompt": object_prompt} if regime is not None
+                         else await ground_scene(path, keyframes))
             masks = await track_video(path, grounding["object_prompt"])
             background = _image_url(await asyncio.to_thread(extract_median_background, path), rgb=True)
             # Save expensive tracking before hypothesis calls so retries cost less.

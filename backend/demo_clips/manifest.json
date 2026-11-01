@@ -36,6 +36,16 @@
       "pixels_per_meter": 160,
       "floor_center_screen_y": 453,
       "equation": "height_ddot = -g; at height=0, v_after=-e*v_before"
+    },
+    "youtube_pendulum.mp4": {
+      "regime": "pendulum",
+      "object_prompt": "ball",
+      "normalized": true,
+      "fps": 30.0,
+      "frames": 135,
+      "width": 1280,
+      "height": 720,
+      "duration_seconds": 4.5
     }
   }
 }

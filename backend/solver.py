@@ -4,7 +4,7 @@ Scalar coordinates must have consistent units; angles are radians and time is
 seconds. Cartesian y is positive upward. Gravity-derived calibration does not
 constitute an independent gravity measurement. Fits never use held-out samples.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pysindy as ps
@@ -46,6 +46,7 @@ class FitResult:
     heldout_r2: float
     heldout_rmse: float
     sparse_proposal: dict[str, float]
+    release_index: int = 0
 
     @property
     def gamma(self) -> float:
@@ -65,12 +66,12 @@ def _validate(times, observations):
     return t - t[0], y
 
 
-def integrate(times, terms, coefficients, initial_state):
+def integrate(times, terms, coefficients, initial_state, theta_eq=0.0):
     """Forward integrate from the first timestamp, using RK45."""
     t = np.asarray(times, dtype=float)
     def rhs(_t, state):
         x, v = state
-        return [v, sum(c * TERMS[term](x, v) for term, c in zip(terms, coefficients))]
+        return [v, sum(c * TERMS[term](x - theta_eq, v) for term, c in zip(terms, coefficients))]
     result = solve_ivp(rhs, (t[0], t[-1]), initial_state, t_eval=t,
                        method="RK45", rtol=1e-8, atol=1e-10)
     if not result.success or result.y.shape[1] != len(t) or not np.all(np.isfinite(result.y)):
@@ -109,7 +110,29 @@ def _score(name, coefficients, initial, prediction, y, split, count, proposal):
                      r2, float(np.sqrt(np.mean(error**2))), proposal)
 
 
-def fit_trajectory(times, observations, *, regime="pendulum", noise_scale=0.015):
+def fit_trajectory(times, observations, *, regime="pendulum", noise_scale=0.015,
+                   release_index=None):
+    """Fit the free-motion window; preserve pre-release observed positions.
+
+    train_size counts active training samples; release_index anchors the fitted
+    initial state in the original observations. Pre-release points are unscored.
+    """
+    from backend.kinematics import detect_release_index
+
+    t, y = _validate(times, observations)
+    if not np.isfinite(noise_scale) or noise_scale <= 0:
+        raise ValueError("Invalid noise_scale")
+    release = (detect_release_index(t, y, regime=regime, noise_scale=noise_scale)
+               if release_index is None else release_index)
+    if not isinstance(release, (int, np.integer)) or release < 0 or len(t) - release < 20:
+        raise ValueError("Release must leave at least 20 free-motion observations")
+    results = _fit_active(t[release:] - t[release], y[release:], regime=regime,
+                          noise_scale=noise_scale)
+    return [replace(r, prediction=np.concatenate((y[:release], r.prediction)),
+                    release_index=int(release)) for r in results]
+
+
+def _fit_active(times, observations, *, regime="pendulum", noise_scale=0.015):
     """Return candidates sorted by training BIC, including a degree-5 baseline.
 
     Fit coefficients AND initial position/velocity on the first 70%. Pendulum
@@ -133,23 +156,37 @@ def fit_trajectory(times, observations, *, regime="pendulum", noise_scale=0.015)
     for name, active in candidates.items():
         # A pruned term may still occur in a physical candidate: give it a
         # nonzero seed and allow shooting to determine its coefficient.
-        initial = [min(proposal[term], -1e-3) for term in active] + [x0, v0]
+        offset = regime == "pendulum"
+        # Correlated position/sine terms in the joint sparse proposal can
+        # cancel, leaving a physical candidate near zero frequency. Seed each
+        # candidate's shooting problem from its own training-only regression.
+        seed, _, _ = _proposal(t[:split], y[:split], active)
+        initial = [min(seed[term], -1e-3) for term in active] + [x0, v0]
+        if offset:
+            initial.append(0.0)
+        def unpack(parameters):
+            return parameters[:len(active)], parameters[len(active):len(active)+2], (parameters[-1] if offset else 0.0)
         def residual(parameters):
             try:
-                predicted = integrate(t[:split], active, parameters[:-2], parameters[-2:])
+                coefficients, state, eq = unpack(parameters)
+                predicted = integrate(t[:split], active, coefficients, state, eq)
                 return predicted - y[:split]
             except (ValueError, FloatingPointError):
                 return np.full(split, 1e10)
+        lower = [-np.inf] * (len(active) + 2) + ([-0.2] if offset else [])
+        upper = [0.0] * len(active) + [np.inf, np.inf] + ([0.2] if offset else [])
         fit = least_squares(
             residual, initial, loss="soft_l1", f_scale=noise_scale,
-            bounds=([-np.inf] * (len(active) + 2), [0.0] * len(active) + [np.inf, np.inf]),
-            max_nfev=500,
+            bounds=(lower, upper), max_nfev=500,
         )
         if not fit.success:
             raise RuntimeError(f"Shooting failed for {name}: {fit.message}")
-        prediction = integrate(t, active, fit.x[:-2], fit.x[-2:])
-        results.append(_score(name, dict(zip(active, fit.x[:-2])), tuple(fit.x[-2:]),
-                              prediction, y, split, len(fit.x), proposal))
+        coefficients, state, eq = unpack(fit.x)
+        prediction = integrate(t, active, coefficients, state, eq)
+        fitted = dict(zip(active, coefficients))
+        if offset:
+            fitted["theta_eq"] = float(eq)
+        results.append(_score(name, fitted, tuple(state), prediction, y, split, len(fit.x), proposal))
     polynomial = np.polynomial.Polynomial.fit(t[:split], y[:split], deg=5)
     results.append(_score("polynomial_degree_5", {}, (float(polynomial(0)), float(polynomial.deriv()(0))),
                           polynomial(t), y, split, 6, proposal))
@@ -305,7 +342,8 @@ def simulate_counterfactual(regime, params, initial_state, times):
             raise ValueError("Invalid pendulum parameters")
         linear = params.get("linear", 0)
         def acceleration(x, v):
-            return -frequency * (x if linear else np.sin(x)) - gamma * v
+            displacement = x - params.get("theta_eq", 0.0)
+            return -frequency * (displacement if linear else np.sin(displacement)) - gamma * v
     elif regime in ("drag", "drag_fall", "vertical_projectile"):
         gravity = params.get("g_pixels", params.get("g", -params.get("constant", -9.81))) * scale
         c1 = params.get("c1", -params.get("velocity", 0))
@@ -336,3 +374,65 @@ def simulate_counterfactual(regime, params, initial_state, times):
     if not np.all(np.isfinite(out)):
         raise ValueError("Simulation diverged")
     return out
+
+
+def calibrate_physical_metrics(analysis, known_object_width_cm=None, known_length_cm=None):
+    """Constant-time scale conversion; never fit or invoke a model here.
+
+    ODE length uses reference gravity for the independent ruler comparison.
+    Width or a supplied string length can instead independently set SI scale.
+    """
+    for value in (known_object_width_cm, known_length_cm):
+        if value is not None and (not np.isfinite(value) or value <= 0):
+            raise ValueError("Calibration dimensions must be positive and finite")
+    regime = analysis["regime"]
+    params, geometry = analysis["discovered_params"], analysis["pivot_or_bounds"]
+    # Preserve only pixel measurements; discard earlier SI calibration results.
+    stored = analysis.get("inferred_physical_metrics", {})
+    keys = ("median_box_width_px", "median_box_height_px", "median_area_px2", "equiv_diameter_px")
+    metrics = {k: stored[k] for k in keys if k in stored}
+    scale = None
+    if known_object_width_cm is not None:
+        width = metrics.get("median_box_width_px", 0)
+        if not np.isfinite(width) or width <= 0:
+            raise ValueError("Analysis lacks mask box width; re-analyze the clip")
+        scale = known_object_width_cm / 100 / width
+        metrics["known_object_width_cm"] = known_object_width_cm
+    if regime == "pendulum":
+        omega2 = params["omega0_squared"]
+        if omega2 <= 0 or geometry["radius"] <= 0:
+            raise ValueError("Pendulum frequency and arc radius must be positive")
+        inferred = 9.81 / omega2
+        metrics.update(L_meters=inferred, L_ode_inferred_m=inferred)
+        if known_length_cm is not None:
+            length = known_length_cm / 100
+            metrics.update(known_length_cm=known_length_cm,
+                           ruler_length_error_percent=100 * abs(inferred - length) / length)
+            if scale is None:
+                scale = length / geometry["radius"]
+        if scale is not None:
+            measured = geometry["radius"] * scale
+            metrics.update(L_measured_m=measured, L_meters=measured,
+                           g_measured_m_s2=omega2 * measured)
+    elif regime in ("drag_fall", "bouncing_ball"):
+        if params["g_pixels"] <= 0:
+            raise ValueError("Pixel gravity must be positive")
+        if scale is not None:
+            metrics["g_measured_m_s2"] = params["g_pixels"] * scale
+        elif regime == "drag_fall":
+            scale = 9.81 / params["g_pixels"]
+        if regime == "bouncing_ball":
+            metrics.update(g_pixels=params["g_pixels"], restitution_e=params["e"])
+    else:
+        raise ValueError("Unknown regime")
+    if scale is not None:
+        metrics.update(meters_per_pixel=scale, pixels_per_meter=1 / scale)
+        if regime == "drag_fall":
+            metrics.update(c1_per_s=params.get("c1", 0), c2_per_m=params.get("c2", 0) / scale)
+        if regime == "bouncing_ball":
+            metrics["floor_m"] = params["floor"] * scale
+    if "g_measured_m_s2" in metrics:
+        metrics["g_error_percent"] = 100 * abs(metrics["g_measured_m_s2"] - 9.81) / 9.81
+    elif regime != "bouncing_ball":
+        metrics["calibration_gravity_m_s2"] = 9.81
+    return metrics

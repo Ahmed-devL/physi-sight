@@ -3,12 +3,16 @@ export type Provider = 'meta' | 'baseten';
 export interface Demo { clip_name: string; url: string; regime: Regime }
 export interface Point {
   frame_idx: number; t: number; pred_x_px: number; pred_y_px: number;
-  x_px?: number; y_px?: number; is_heldout?: boolean;
+  x_px?: number; y_px?: number; is_heldout?: boolean; is_pre_release?: boolean;
 }
 export interface Phase { position: number; velocity: number }
 export interface Simulation { trajectory_points: Point[]; phase_space: Phase[]; phase_units: string }
 export interface Analysis {
   regime: Regime;
+  video_sha256: string;
+  video_url?: string;
+  release_frame_idx?: number;
+  release_time?: number;
   latex_equation: string;
   plain_english_explanation: string;
   discovered_params: Record<string, number>;
@@ -48,12 +52,12 @@ export async function request<T>(path: string, options: RequestInit = {}): Promi
 }
 export interface Controls { gravity: number; damping: number; restitution: number }
 export const defaults = (analysis: Analysis): Controls => ({
-  gravity: 9.81,
+  gravity: analysis.inferred_physical_metrics.g_measured_m_s2 ?? 9.81,
   damping: analysis.discovered_params.gamma ?? analysis.discovered_params.c1 ?? 0,
   restitution: analysis.discovered_params.e ?? 0.8,
 });
 export function simulate(analysis: Analysis, controls: Controls, signal: AbortSignal) {
-  const params: Record<string, number> = { ...analysis.discovered_params, g_scale: controls.gravity / 9.81 };
+  const params: Record<string, number> = { ...analysis.discovered_params, g_scale: controls.gravity / defaults(analysis).gravity };
   if (analysis.regime === 'pendulum') params.gamma = controls.damping;
   if (analysis.regime === 'drag_fall') params.c1 = controls.damping;
   if (analysis.regime === 'bouncing_ball') params.e = controls.restitution;
