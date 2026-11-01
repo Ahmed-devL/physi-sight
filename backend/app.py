@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from backend.agent import analyze_video
 from backend.solver import simulate_counterfactual, calibrate_physical_metrics, mechanical_energy_diagnostics
+from backend.solver import quantity_provenance, scale_warnings
 from backend.cache import CACHE_DIR
 
 DEMO_DIR = Path(__file__).resolve().parent / "demo_clips"
@@ -46,9 +47,12 @@ def demos():
                       for name, metadata in manifest["clips"].items()]}
 
 
-async def _analyze(path, force_live, model_provider, known_object_width_cm=None, known_length_cm=None):
+async def _analyze(path, force_live, model_provider, known_object_width_cm=None, known_length_cm=None,
+                   wonder_enabled=True):
     try:
         options = {"force_live": force_live, "model_provider": model_provider}
+        if not wonder_enabled:
+            options["wonder_enabled"] = False
         if path.parent == DEMO_DIR:
             registered = _manifest()["clips"].get(path.name, {})
             if "regime" in registered and "object_prompt" in registered:
@@ -72,16 +76,19 @@ async def _analyze(path, force_live, model_provider, known_object_width_cm=None,
 @app.post("/api/analyze/demo/{clip_name}")
 async def analyze_demo(clip_name: str, force_live: bool = False,
                        model_provider: Literal["meta", "baseten"] = "meta",
+                       wonder_enabled: bool = True,
                        known_object_width_cm: float | None = Query(default=None, gt=0, allow_inf_nan=False),
                        known_length_cm: float | None = Query(default=None, gt=0, allow_inf_nan=False)):
     if clip_name not in _manifest()["clips"]:
         raise HTTPException(404, "Unknown demo clip")
-    return await _analyze(DEMO_DIR / clip_name, force_live, model_provider, known_object_width_cm, known_length_cm)
+    return await _analyze(DEMO_DIR / clip_name, force_live, model_provider, known_object_width_cm,
+                          known_length_cm, wonder_enabled)
 
 
 @app.post("/api/analyze/upload")
 async def analyze_upload(file: UploadFile = File(...), force_live: bool = False,
                          model_provider: Literal["meta", "baseten"] = "meta",
+                         wonder_enabled: bool = True,
                        known_object_width_cm: float | None = Query(default=None, gt=0, allow_inf_nan=False),
                        known_length_cm: float | None = Query(default=None, gt=0, allow_inf_nan=False)):
     temporary = None
@@ -98,7 +105,8 @@ async def analyze_upload(file: UploadFile = File(...), force_live: bool = False,
                 target.write(chunk)
         if size == 0:
             raise HTTPException(422, "MP4 is empty")
-        return await _analyze(temporary, force_live, model_provider, known_object_width_cm, known_length_cm)
+        return await _analyze(temporary, force_live, model_provider, known_object_width_cm,
+                              known_length_cm, wonder_enabled)
     finally:
         await file.close()
         if temporary is not None:
@@ -162,6 +170,7 @@ class StoredAnalysis(BaseModel):
     # Accept the existing analysis response, while validating the export inputs.
     model_config = ConfigDict(extra="ignore", allow_inf_nan=False)
     regime: Literal["pendulum", "drag_fall", "bouncing_ball"]
+    selected_candidate: str | None = None
     discovered_params: dict[str, float]
     pivot_or_bounds: dict[str, float]
     inferred_physical_metrics: dict[str, float] = Field(default_factory=dict)
@@ -184,7 +193,12 @@ def calibrate(request: CalibrationRequest):
                                              request.known_object_width_cm, request.known_length_cm)
     except (ValueError, KeyError, ZeroDivisionError) as error:
         raise HTTPException(422, str(error)) from error
-    return {"inferred_physical_metrics": metrics}
+    analysis = {**request.analysis.model_dump(exclude={"trajectory_points"}),
+                "inferred_physical_metrics": metrics}
+    return {"inferred_physical_metrics": metrics,
+            "quantity_provenance": quantity_provenance(analysis, request.known_object_width_cm,
+                                                        request.known_length_cm),
+            "scientific_warnings": scale_warnings(analysis)}
 
 
 def simulator_source(analysis):

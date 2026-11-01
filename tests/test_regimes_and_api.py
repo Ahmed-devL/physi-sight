@@ -142,10 +142,9 @@ def test_agent_pipeline_cache_force_and_provider(tmp_path, monkeypatch, regime, 
     cache = DiskCache(tmp_path)
     ground = AsyncMock(return_value={"regime": regime, "object_prompt": "ball"})
     track = AsyncMock(return_value=_fixture_masks(regime))
-    hypotheses = AsyncMock(return_value=[
-        {"step": 1, "plain_english_explanation": "Baseline tested"},
-        {"step": 2, "plain_english_explanation": "Dissipation improves forecast"},
-    ])
+    hypotheses = AsyncMock(return_value={"candidate": {
+        "pendulum": "nonlinear_pendulum", "drag_fall": "quadratic_drag",
+        "bouncing_ball": "inelastic_bounces"}[regime], "rationale": "Test physical dissipation"})
     monkeypatch.setattr(agent, "ground_scene", ground)
     monkeypatch.setattr(agent, "track_video", track)
     monkeypatch.setattr(agent, "hypothesis_loop", hypotheses)
@@ -234,21 +233,21 @@ def _response(content):
     return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 
 
-def test_two_step_hypothesis_loop_uses_real_scores(monkeypatch):
+def test_one_hypothesis_uses_training_scores(monkeypatch):
     client = MagicMock()
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=None)
     client.chat.completions.create = AsyncMock(return_value=_response(
-        '{"hypothesis":"drag","evidence":"BIC and RMSE","conclusion":"supported",'
-        '"plain_english_explanation":"Drag limits speed"}'))
+        '{"candidate":"mixed_drag","rationale":"Systematic training residuals"}'))
     monkeypatch.setattr(agent, "_hypothesis_client", lambda p: (client, "test-model"))
-    evidence = {"regime": "drag_fall", "selected_candidate": "quadratic_drag", "discovered_params": {},
-                "candidate_comparison_table": [{"name": "free_fall", "bic": 10, "heldout_rmse": 3}],
-                "inferred_physical_metrics": {}, "metric_units": "pixels"}
+    evidence = {"regime": "drag_fall", "baseline_fit": {"training_bic": 10},
+                "candidate_library": agent.candidate_library("drag_fall")}
     result = asyncio.run(agent.hypothesis_loop(evidence, "meta"))
-    assert len(result) == 2
-    assert client.chat.completions.create.await_count == 2
-    assert "\"heldout_rmse\": 3" in client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+    assert result["candidate"] == "mixed_drag"
+    assert client.chat.completions.create.await_count == 1
+    prompt = client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+    assert '"training_bic": 10' in prompt
+    assert "heldout" not in prompt
 
 
 def test_grounding_fallback_and_sam_wire_contract(monkeypatch):

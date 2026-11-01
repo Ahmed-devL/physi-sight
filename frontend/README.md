@@ -1,6 +1,6 @@
 # PhysiSight scientific workbench
 
-Built with Muse Spark Open
+Built with Muse Spark Open — model license attribution.
 
 Start the FastAPI backend from the repository root:
 
@@ -17,7 +17,7 @@ npm run dev
 ```
 
 Open http://localhost:5173. Select a demo or upload an MP4 (up to 100 MB),
-choose the model provider, and click **Analyze motion**. Analysis requests use
+use the configured hypothesis provider, and click **Analyze motion**. Analysis requests use
 backend caches unless **Force Live API Re-run** is enabled. Switching the clip
 or provider clears the displayed analysis; re-run explicitly to fetch results.
 No results are fabricated. Baseten requires backend configuration.
@@ -76,3 +76,7 @@ After installing dependencies, run `npm run build`, then use all three demos:
    appear on the new video. Upload an H.264 MP4 and analyze it.
 6. Stop the backend to inspect errors and retry. Check a narrow/mobile layout
    and keyboard access to playback, toggles, controls, and reasoning.
+
+See the root README for model roles, training-only hypothesis validation and
+offline replay requirements. Disabling proposals does not disable SAM or scene
+grounding on a cache miss. Run `npm test` for the five SAM rendering scenarios.

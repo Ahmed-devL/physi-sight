@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef } from 'react';
 import type { RefObject } from 'react';
 import { bracket, observationStart } from './api';
+import { prepareSAMFrames, mediaTime, frameAtMediaTime, renderSAMFrame } from './samOverlay';
 import type { Analysis, Point, Simulation } from './api';
 
 const CREAM = '#D79921', SAGE = '#687D31', GOLD = '#D65D0E';
-export interface Layers { tracked: boolean; forecast: boolean; ghost: boolean; background: boolean }
+export interface Layers { tracked: boolean; forecast: boolean; ghost: boolean; background: boolean; masks: boolean; boxes: boolean }
 
 function useCanvas(draw: (ctx: CanvasRenderingContext2D, w: number, h: number) => void) {
   const ref = useRef<HTMLCanvasElement>(null);
@@ -59,6 +60,7 @@ export function Overlay({ analysis, simulation, layers, videoRef }: {
       ghost: path(simulation?.trajectory_points ?? [], p => p.pred_x_px, p => p.pred_y_px),
     };
   }, [analysis, simulation]);
+  const masksByFrame = useMemo(() => prepareSAMFrames(analysis?.segmentation_overlays?.frames ?? []), [analysis]);
   // requestVideoFrameCallback supplies the presented media timestamp; paused
   // seeks use currentTime immediately rather than waiting for another frame.
   const presented = useRef(0);
@@ -78,8 +80,12 @@ export function Overlay({ analysis, simulation, layers, videoRef }: {
     const { width: sourceW, height: sourceH } = analysis.video_metadata;
     const sx = width / sourceW, sy = height / sourceH;
     const video = videoRef.current;
-    const time = (video?.paused || !video?.requestVideoFrameCallback ? video?.currentTime ?? 0 : presented.current) - observationStart(analysis);
+    const sourceTime = mediaTime(video, presented.current);
+    const time = sourceTime - observationStart(analysis);
+    const stamps = analysis.video_metadata.timestamps;
+    const sourceFrame = frameAtMediaTime(stamps, sourceTime);
     ctx.save(); ctx.scale(sx, sy); ctx.lineWidth = 3 / sx;
+    renderSAMFrame(ctx, masksByFrame.get(sourceFrame), layers.masks, layers.boxes, sx);
     if (layers.tracked) {
       ctx.strokeStyle = CREAM; ctx.globalAlpha = 0.6; ctx.stroke(paths.train); ctx.globalAlpha = 1;
       for (const p of analysis.trajectory_points) {
@@ -115,13 +121,24 @@ export function Overlay({ analysis, simulation, layers, videoRef }: {
       if (p.is_heldout ? layers.forecast : layers.tracked) {
         const xKey = p.is_heldout ? 'pred_x_px' : 'x_px';
         const yKey = p.is_heldout ? 'pred_y_px' : 'y_px';
-        dot(ctx, p[xKey]! + (q[xKey]! - p[xKey]!) * f,
-          p[yKey]! + (q[yKey]! - p[yKey]!) * f, p.is_heldout ? SAGE : CREAM, 3 / sx);
+        const x = p[xKey]! + (q[xKey]! - p[xKey]!) * f;
+        const y = p[yKey]! + (q[yKey]! - p[yKey]!) * f;
+        const observed = p.frame_idx === sourceFrame ? p : q.frame_idx === sourceFrame ? q : null;
+        if (p.is_heldout) {
+          dot(ctx, x, y, SAGE, 3 / sx);
+        } else if (observed) {
+          dot(ctx, observed.x_px!, observed.y_px!, CREAM, 3 / sx);
+        } else {
+          ctx.beginPath(); ctx.arc(x, y, 5 / sx, 0, Math.PI*2);
+          ctx.strokeStyle = CREAM; ctx.setLineDash([2 / sx, 2 / sx]); ctx.stroke(); ctx.setLineDash([]);
+          ctx.fillStyle = CREAM; ctx.font = `${11 / sx}px sans-serif`;
+          ctx.fillText('Interpolated position', x + 9 / sx, y - 9 / sx);
+        }
       }
     }
     ctx.restore();
   });
-  return <canvas ref={ref} className="video-overlay" aria-label="Tracked centroids, held-out forecast, and counterfactual trajectory overlay" />;
+  return <canvas ref={ref} className="video-overlay" aria-label="Observed SAM contours and boxes, centroids, held-out forecast, and counterfactual overlay" />;
 }
 
 export function PhasePortrait({ analysis, baseline, simulation, videoRef, showGhost }: {

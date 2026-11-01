@@ -14,9 +14,35 @@ export interface EnergyDiagnostics {
 }
 export interface Simulation { energy_diagnostics: EnergyDiagnostics; trajectory_points: Point[]; phase_space: Phase[]; phase_units: string }
 export interface Analysis {
+  run_provenance?: {
+    execution_mode: string; original_execution_mode?: string; cache_integrity_verified?: boolean;
+    cache_note?: string; api_calls_this_request: number; grounding_source?: string; tracking_source?: string;
+    model_calls?: { stage: string; requested_model: string; response_model: string | null;
+      status: string; api_elapsed_seconds: number; error_type?: string }[];
+  };
+  timings?: { solver_execution_seconds: number; api_elapsed_seconds: number; solver_scope: string; api_scope: string };
+  proposal_evidence_fit?: { name: string; training_bic: number };
+  baseline_fit?: { name: string; training_bic: number };
+  wonder_proposal?: { status: string; candidate?: string; rationale?: string; error_type?: string };
+  proposal_fit?: { name: string; training_bic: number } | null;
+  bic_verdict?: { selected: string; delta_bic_vs_baseline: number; winning_equation_changed: boolean };
+  heldout_evaluation?: { baseline: { r2: number; rmse: number }; selected: { r2: number; rmse: number } };
+  fallback_used?: boolean;
+  segmentation_overlays?: {
+    frames: { frame_idx: number; source: 'sam'; box: [number, number, number, number];
+      polygons: { points: [number, number][]; hole: boolean }[]; status: string }[];
+    omitted_frames: number; omitted_contours: number; vertex_count: number; approximation: string;
+  };
+  quantity_provenance?: Record<string, { kind: string; source: string }>;
+  scientific_warnings?: { code: string; message: string }[];
+  parameter_uncertainty?: {
+    method: string; status: string; limitations: string;
+    parameters: Record<string, { estimate: number; standard_error: number | null; status: string; nuisance: boolean }>;
+  };
   energy_diagnostics: EnergyDiagnostics;
   regime: Regime;
   video_sha256: string;
+  analysis_integrity_sha256?: string;
   video_url?: string;
   release_frame_idx?: number;
   release_time?: number;
@@ -26,7 +52,8 @@ export interface Analysis {
   inferred_physical_metrics: Record<string, number>;
   train_r2: number | null; heldout_r2: number | null; heldout_rmse: number | null;
   metric_units: string;
-  candidate_comparison_table: { name: string; bic: number | null; heldout_r2: number; heldout_rmse: number; selected: boolean }[];
+  candidate_comparison_table: { name: string; bic: number | null; heldout_r2: number; heldout_rmse: number;
+    selected: boolean; eligible_for_selection?: boolean; exclusion_reason?: string | null }[];
   trajectory_points: Point[];
   initial_state: [number, number];
   pivot_or_bounds: Record<string, number>;

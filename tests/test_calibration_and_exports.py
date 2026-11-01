@@ -298,8 +298,12 @@ def test_all_comparison_candidates_have_numeric_heldout_scores(regime):
         assert np.isfinite(row['heldout_rmse'])
         assert row['heldout_rmse'] >= 0
         if row['selected']:
+            assert row['eligible_for_selection']
             assert row['heldout_r2'] == result['heldout_r2']
             assert row['heldout_rmse'] == result['heldout_rmse']
+        if row['name'] == 'polynomial_degree_5':
+            assert not row['eligible_for_selection']
+            assert row['exclusion_reason'] == 'Polynomial diagnostic'
 
 
 def test_constant_heldout_r2_is_finite():

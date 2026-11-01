@@ -4,7 +4,7 @@ Scalar coordinates must have consistent units; angles are radians and time is
 seconds. Cartesian y is positive upward. Gravity-derived calibration does not
 constitute an independent gravity measurement. Fits never use held-out samples.
 """
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pysindy as ps
@@ -33,6 +33,51 @@ CANDIDATES = {
     },
     "spring": {"damped_spring": ("position", "velocity")},
 }
+# Optional hypotheses never change the original deterministic candidate library.
+OPTIONAL_CANDIDATES = {"drag": {
+    "mixed_drag": ("constant", "velocity", "quadratic_drag"),
+}}
+
+
+def candidate_library(regime):
+    regime = {"drag_fall": "drag", "vertical_projectile": "drag"}.get(regime, regime)
+    if regime == "bouncing_ball":
+        return {"elastic_bounces": (), "inelastic_bounces": ()}
+    return {**CANDIDATES.get(regime, {}), **OPTIONAL_CANDIDATES.get(regime, {})}
+
+
+def term_bounds(regime, term):
+    """Bounds are acceleration-term specific, in upward Cartesian coordinates."""
+    if term == "constant" and regime == "drag":
+        return -np.inf, -1e-9  # strictly downward gravity
+    if term in ("velocity", "quadratic_drag"):
+        return -np.inf, 0.0  # dissipative; physical c1/c2 are their negatives
+    if term in ("position", "sin_position") and regime in ("pendulum", "spring"):
+        return -np.inf, -1e-9  # restoring
+    raise ValueError("Term is not physical in this regime")
+
+
+def valid_sparse_structure(regime, proposal, t, y):
+    """Accept only identifiable subsets of the regime's physical library.
+
+    In particular a pendulum cannot combine position and sin(position), and
+    drag must include downward gravity. Derivatives only screen structures.
+    """
+    active = tuple(k for k, v in proposal.items() if abs(v) > 1e-10)
+    if not active or not all(np.isfinite(v) for v in proposal.values()):
+        return ()
+    if not any(set(active) == set(v) for v in candidate_library(regime).values()):
+        return ()
+    for term in active:
+        lo, hi = term_bounds(regime, term)
+        if not lo <= proposal[term] <= hi:
+            return ()
+    velocity = np.gradient(y, t)
+    design = np.column_stack([np.broadcast_to(TERMS[k](y, velocity), y.shape) for k in active])
+    norms = np.linalg.norm(design, axis=0)
+    if np.any(norms == 0) or np.linalg.cond(design / norms) > 1e6:
+        return ()
+    return active
 
 
 @dataclass(frozen=True)
@@ -43,10 +88,12 @@ class FitResult:
     prediction: np.ndarray
     train_size: int
     bic: float
-    heldout_r2: float
-    heldout_rmse: float
+    heldout_r2: float | None
+    heldout_rmse: float | None
     sparse_proposal: dict[str, float]
     release_index: int = 0
+    locally_identifiable: bool = True
+    uncertainty: dict = field(default_factory=dict)
 
     @property
     def gamma(self) -> float:
@@ -100,21 +147,92 @@ def _proposal(t, y, terms):
     return dict(zip(terms, coefficients)), float(smooth[0]), float(velocity[0])
 
 
-def _score(name, coefficients, initial, prediction, y, split, count, proposal):
+def local_uncertainty(fit, names, noise_scale):
+    """Approximate soft_l1 sandwich covariance, conditional on the chosen law.
+
+    SciPy returns a robust-loss-adjusted Jacobian. Undo that row weighting
+    for the score variance, retain it for the curvature, and include ALL
+    fitted initial conditions/offsets as nuisance parameters. Never use a
+    pseudoinverse to manufacture intervals for a deficient problem.
+    This local approximation excludes geometry, calibration, correlated
+    tracking error, and model-selection uncertainty; it is not a 95% CI.
+    """
+    jac = np.asarray(fit.jac, dtype=float)
+    n, p = jac.shape
+    norms = np.linalg.norm(jac, axis=0)
+    valid = np.all(np.isfinite(jac)) and np.all(norms > 0)
+    scaled = jac / norms if valid else np.zeros_like(jac)
+    rank = int(np.linalg.matrix_rank(scaled)) if valid else 0
+    condition = float(np.linalg.cond(scaled)) if valid else np.inf
+    at_bound = np.asarray(fit.active_mask) != 0
+    status = ("rank_deficient" if rank < p or n <= p else
+              "ill_conditioned" if condition > 1e6 else
+              "boundary_limited" if np.any(at_bound) else "approximate_local")
+    if status == "approximate_local" and np.max(np.abs(fit.fun)) <= 1e-12:
+        status = "insufficient_residual_variation"
+    errors = None
+    if status == "approximate_local":
+        z = (fit.fun / noise_scale)**2
+        derivative = (1 + z)**-1.5
+        if np.min(derivative) < 1e-12:
+            status = "robust_loss_saturated"
+        else:
+            # Bread: robust curvature. Meat: empirical variance of scores.
+            raw = scaled / np.sqrt(derivative[:, None])
+            psi = fit.fun / np.sqrt(1 + z)
+            bread = scaled.T @ scaled
+            meat = (raw * psi[:, None]).T @ (raw * psi[:, None])
+            try:
+                left = np.linalg.solve(bread, meat)
+                covariance = np.linalg.solve(bread, left.T).T
+                covariance *= n / (n - p)
+                diagonal = np.diag(covariance) / norms**2
+                if not np.all(np.isfinite(diagonal)) or np.any(diagonal < 0):
+                    status = "unstable_covariance"
+                else:
+                    errors = np.sqrt(diagonal)
+            except np.linalg.LinAlgError:
+                status = "rank_deficient"
+    parameters = {}
+    for i, name in enumerate(names):
+        error = float(errors[i]) if errors is not None else None
+        # A near-zero coefficient with an appreciable error is unresolved.
+        unresolved = error is not None and error > .5 * max(abs(float(fit.x[i])), 1e-12)
+        parameters[name] = {"estimate": float(fit.x[i]),
+                            "standard_error": None if unresolved else error,
+                            "status": "weakly_identified" if unresolved else status,
+                            "at_bound": bool(at_bound[i]),
+                            "nuisance": name in ("initial_position", "initial_velocity", "initial_height_above_floor", "theta_eq")}
+    return {"method": "approximate_local_soft_l1_sandwich", "confidence_interval": None,
+            "rank": rank, "parameter_count_including_nuisance": p,
+            "scaled_jacobian_condition": condition if np.isfinite(condition) else None,
+            "status": status, "parameters": parameters,
+            "limitations": "Conditional on tracking geometry, calibration and selected law; assumes independent residuals. Not a guaranteed 95% confidence interval."}
+
+
+def _score(name, coefficients, initial, prediction, y, split, count, proposal, *, evaluate=True):
     rss = max(float(np.sum((prediction[:split] - y[:split]) ** 2)), np.finfo(float).tiny)
     bic = split * np.log(rss / split) + count * np.log(split)
-    error = prediction[split:] - y[split:]
+    result = FitResult(name, coefficients, initial, prediction, split, float(bic),
+                       None, None, proposal)
+    return evaluate_fit(result, y) if evaluate else result
+
+
+def evaluate_fit(result, observations):
+    """Post-selection forecast evaluation; never used by fitting or filtering."""
+    split = result.release_index + result.train_size
+    y = np.asarray(observations)
+    error = result.prediction[split:] - y[split:]
     variance = np.sum((y[split:] - y[split:].mean()) ** 2)
     # Finite constant-target convention: perfect forecast = 1, otherwise 0.
     # Keep genuinely negative R² values intact for alternative-model comparisons.
     squared_error = float(np.sum(error**2))
     r2 = float(1 - squared_error / variance) if variance > 0 else float(squared_error == 0)
-    return FitResult(name, coefficients, initial, prediction, split, float(bic),
-                     r2, float(np.sqrt(np.mean(error**2))), proposal)
+    return replace(result, heldout_r2=r2, heldout_rmse=float(np.sqrt(np.mean(error**2))))
 
 
 def fit_trajectory(times, observations, *, regime="pendulum", noise_scale=0.015,
-                   release_index=None):
+                   release_index=None, candidate=None, evaluate_heldout=True, include_sparse=True):
     """Fit the free-motion window; preserve pre-release observed positions.
 
     train_size counts active training samples; release_index anchors the fitted
@@ -130,12 +248,15 @@ def fit_trajectory(times, observations, *, regime="pendulum", noise_scale=0.015,
     if not isinstance(release, (int, np.integer)) or release < 0 or len(t) - release < 20:
         raise ValueError("Release must leave at least 20 free-motion observations")
     results = _fit_active(t[release:] - t[release], y[release:], regime=regime,
-                          noise_scale=noise_scale)
-    return [replace(r, prediction=np.concatenate((y[:release], r.prediction)),
-                    release_index=int(release)) for r in results]
+                          noise_scale=noise_scale, candidate=candidate, include_sparse=include_sparse)
+    results = [replace(r, prediction=np.concatenate((y[:release], r.prediction)),
+                       release_index=int(release)) for r in results]
+    # BIC order is fixed before compatibility diagnostics evaluate forecasts.
+    return [evaluate_fit(r, y) for r in results] if evaluate_heldout else results
 
 
-def _fit_active(times, observations, *, regime="pendulum", noise_scale=0.015):
+def _fit_active(times, observations, *, regime="pendulum", noise_scale=0.015, candidate=None,
+                include_sparse=True):
     """Return candidates sorted by training BIC, including a degree-5 baseline.
 
     Fit coefficients AND initial position/velocity on the first 70%. Pendulum
@@ -144,16 +265,23 @@ def _fit_active(times, observations, *, regime="pendulum", noise_scale=0.015):
     """
     t, y = _validate(times, observations)
     if regime == "bouncing_ball":
-        return _fit_bounces(t, y, noise_scale)
+        if candidate is not None and candidate not in candidate_library(regime):
+            raise ValueError("Invalid candidate")
+        return _fit_bounces(t, y, noise_scale, candidate=candidate)
     regime = {"drag_fall": "drag", "vertical_projectile": "drag"}.get(regime, regime)
     if regime not in CANDIDATES or not np.isfinite(noise_scale) or noise_scale <= 0:
         raise ValueError("Unknown regime or invalid noise_scale")
     split = int(0.7 * len(t))
     candidates = dict(CANDIDATES[regime])
+    if candidate is not None:
+        library = candidate_library(regime)
+        if candidate not in library:
+            raise ValueError("Invalid candidate")
+        candidates = {candidate: library[candidate]}
     terms = tuple(dict.fromkeys(term for terms in candidates.values() for term in terms))
     proposal, x0, v0 = _proposal(t[:split], y[:split], terms)
-    sparse = tuple(term for term, value in proposal.items() if abs(value) > 1e-10)
-    if sparse and sparse not in candidates.values():
+    sparse = valid_sparse_structure(regime, proposal, t[:split], y[:split])
+    if include_sparse and candidate is None and sparse and sparse not in candidates.values():
         candidates["sparse_" + regime] = sparse
     results = []
     for name, active in candidates.items():
@@ -164,7 +292,9 @@ def _fit_active(times, observations, *, regime="pendulum", noise_scale=0.015):
         # cancel, leaving a physical candidate near zero frequency. Seed each
         # candidate's shooting problem from its own training-only regression.
         seed, _, _ = _proposal(t[:split], y[:split], active)
-        initial = [min(seed[term], -1e-3) for term in active] + [x0, v0]
+        bounds = [term_bounds(regime, term) for term in active]
+        initial = [np.clip(seed[term], lo if np.isfinite(lo) else -1e10, hi - 1e-3)
+                   for term, (lo, hi) in zip(active, bounds)] + [x0, v0]
         if offset:
             initial.append(0.0)
         def unpack(parameters):
@@ -176,23 +306,33 @@ def _fit_active(times, observations, *, regime="pendulum", noise_scale=0.015):
                 return predicted - y[:split]
             except (ValueError, FloatingPointError):
                 return np.full(split, 1e10)
-        lower = [-np.inf] * (len(active) + 2) + ([-0.2] if offset else [])
-        upper = [0.0] * len(active) + [np.inf, np.inf] + ([0.2] if offset else [])
+        lower = [b[0] for b in bounds] + [-np.inf] * 2 + ([-0.2] if offset else [])
+        upper = [b[1] for b in bounds] + [np.inf, np.inf] + ([0.2] if offset else [])
         fit = least_squares(
             residual, initial, loss="soft_l1", f_scale=noise_scale,
             bounds=(lower, upper), max_nfev=500,
         )
         if not fit.success:
+            if name.startswith("sparse_"):
+                continue
             raise RuntimeError(f"Shooting failed for {name}: {fit.message}")
+        norms = np.linalg.norm(fit.jac, axis=0)
+        identifiable = bool(np.all(norms > 0) and np.linalg.cond(fit.jac / norms) <= 1e6)
+        if name.startswith("sparse_") and not identifiable:
+            continue
         coefficients, state, eq = unpack(fit.x)
         prediction = integrate(t, active, coefficients, state, eq)
         fitted = dict(zip(active, coefficients))
         if offset:
             fitted["theta_eq"] = float(eq)
-        results.append(_score(name, fitted, tuple(state), prediction, y, split, len(fit.x), proposal))
-    polynomial = np.polynomial.Polynomial.fit(t[:split], y[:split], deg=5)
-    results.append(_score("polynomial_degree_5", {}, (float(polynomial(0)), float(polynomial.deriv()(0))),
-                          polynomial(t), y, split, 6, proposal))
+        result = _score(name, fitted, tuple(state), prediction, y, split, len(fit.x), proposal, evaluate=False)
+        uncertainty = local_uncertainty(fit, [*active, "initial_position", "initial_velocity",
+                                            *(["theta_eq"] if offset else [])], noise_scale)
+        results.append(replace(result, locally_identifiable=identifiable, uncertainty=uncertainty))
+    if candidate is None:
+        polynomial = np.polynomial.Polynomial.fit(t[:split], y[:split], deg=5)
+        results.append(_score("polynomial_degree_5", {}, (float(polynomial(0)), float(polynomial.deriv()(0))),
+                              polynomial(t), y, split, 6, proposal, evaluate=False))
     return sorted(results, key=lambda result: result.bic)
 
 
@@ -260,7 +400,7 @@ def _bounce_states(times, gravity, restitution, floor, initial_state, *, events=
     return out
 
 
-def _fit_bounces(t, y, noise_scale):
+def _fit_bounces(t, y, noise_scale, *, candidate=None):
     if not np.isfinite(noise_scale) or noise_scale <= 0:
         raise ValueError("Invalid noise_scale")
     split = int(0.7 * len(t))
@@ -290,6 +430,8 @@ def _fit_bounces(t, y, noise_scale):
     e0 = float(np.clip(np.median(ratios) if ratios else 0.8, 0.1, 0.99))
     results = []
     for name, fixed_e in (("elastic_bounces", 1.0), ("inelastic_bounces", None)):
+        if candidate is not None and candidate != name:
+            continue
         def unpack(p):
             g, f, offset, v = p[:4]
             return g, (p[4] if fixed_e is None else fixed_e), f, (f + offset, v)
@@ -308,8 +450,12 @@ def _fit_bounces(t, y, noise_scale):
             raise RuntimeError(f"Shooting failed for {name}")
         g, e, f, state = unpack(fit.x)
         prediction = _bounce_states(t, g, e, f, state)[:, 0]
-        results.append(_score(name, {"g_pixels": g, "e": e, "floor": f},
-                              tuple(state), prediction, y, split, len(fit.x), {}))
+        result = _score(name, {"g_pixels": g, "e": e, "floor": f},
+                        tuple(state), prediction, y, split, len(fit.x), {}, evaluate=False)
+        uncertainty = local_uncertainty(fit, ["g_pixels", "floor", "initial_height_above_floor",
+                                            "initial_velocity", *(["e"] if fixed_e is None else [])], noise_scale)
+        results.append(replace(result, uncertainty=uncertainty,
+                               locally_identifiable=uncertainty["status"] not in ("rank_deficient", "ill_conditioned")))
     return sorted(results, key=lambda result: result.bic)
 
 
@@ -446,6 +592,50 @@ def calibrate_physical_metrics(analysis, known_object_width_cm=None, known_lengt
     elif regime != "bouncing_ball":
         metrics["calibration_gravity_m_s2"] = 9.81
     return metrics
+
+
+def quantity_provenance(analysis, known_object_width_cm=None, known_length_cm=None):
+    """Classify reported quantities without confusing calibration with a fit."""
+    result = {key: {"kind": "fitted", "source": "raw training observations; trajectory shooting"}
+              for key in analysis["discovered_params"]}
+    if "linear" in result:
+        result["linear"] = {"kind": "selected_structure", "source": "training BIC"}
+    if analysis.get("selected_candidate") == "elastic_bounces":
+        result["e"] = {"kind": "fixed_by_candidate", "source": "elastic hypothesis"}
+    independent = known_object_width_cm is not None or (
+        analysis["regime"] == "pendulum" and known_length_cm is not None)
+    for key in analysis.get("inferred_physical_metrics", {}):
+        if key in ("median_box_width_px", "median_box_height_px", "median_area_px2", "equiv_diameter_px"):
+            kind, source = "segmentation_measured", "observed SAM masks; source pixels"
+        elif key.startswith("known_"):
+            kind, source = "independent_input", "user supplied dimension; accuracy not verified"
+        elif key == "calibration_gravity_m_s2":
+            kind, source = "reference_assumption", "g = 9.81 m/s² sets physical scale"
+        elif key in ("g_pixels", "restitution_e", "c1_per_s"):
+            kind, source = "fitted", "training trajectory; no independent length scale needed"
+        elif key in ("L_ode_inferred_m", "ruler_length_error_percent") or (key == "L_meters" and not independent):
+            kind, source = "gravity_derived", "L = 9.81 / omega0_squared; gravity assumed"
+        elif independent:
+            kind = "independently_calibrated"
+            source = ("user supplied object width and observed mask width" if known_object_width_cm is not None
+                      else "user supplied pendulum length and fitted arc radius")
+        elif analysis["regime"] == "drag_fall":
+            kind, source = "gravity_derived", "known g = 9.81 m/s² calibrates pixel scale"
+        else:
+            kind, source = "derived", "fitted quantities; physical scale may be ambiguous"
+        result[key] = {"kind": kind, "source": source}
+    return result
+
+
+def scale_warnings(analysis, warnings=()):
+    result = [w for w in warnings if w["code"] != "ambiguous_physical_scale"]
+    metrics = analysis.get("inferred_physical_metrics", {})
+    if "g_measured_m_s2" not in metrics:
+        result.append({"code": "ambiguous_physical_scale", "message": (
+            "Gravity is fitted in pixels; no independent SI length scale is available."
+            if analysis["regime"] == "bouncing_ball" else
+            "SI scale uses assumed gravity (9.81 m/s²). Gravity and length are not independently identified.")})
+    return result
 
 
 def mechanical_energy_diagnostics(regime, params, times, states, *, metrics=None,

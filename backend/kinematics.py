@@ -27,6 +27,66 @@ class MaskMoments:
     mu_02: float
 
 
+def mask_contours(mask, *, max_rings=64, max_vertices=512, tolerance_px=.75):
+    """Simplify each real mask boundary independently in source coordinates.
+
+    Rings include holes and disconnected components; even-odd filling retains
+    their topology. Boundaries follow foreground pixel centers (OpenCV), with
+    at most tolerance_px simplification error. Degenerate one/two-pixel rings
+    remain degenerate; consumers may stroke them. Never replace a collection
+    of components with a convex hull or silently discard small components.
+    """
+    x1, y1, x2, y2 = mask.box
+    raster = np.asarray(mask.raster, dtype=np.uint8)
+    if raster.ndim != 2 or raster.shape != (y2-y1+1, x2-x1+1):
+        return {"polygons": [], "status": "invalid_box_local_dimensions"}
+    contours, hierarchy = cv2.findContours((raster != 0).astype(np.uint8),
+                                          cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) > max_rings:
+        return {"polygons": [], "status": "contour_budget_exceeded"}
+    polygons = []
+    vertices = 0
+    for index, contour in enumerate(contours):
+        simplified = cv2.approxPolyDP(contour, tolerance_px, True).reshape(-1, 2)
+        # A simplification may collapse a thin component; preserve its boundary.
+        if len(simplified) < min(3, len(contour)):
+            simplified = contour.reshape(-1, 2)
+        vertices += len(simplified)
+        if vertices > max_vertices:
+            return {"polygons": [], "status": "contour_budget_exceeded"}
+        depth, parent = 0, int(hierarchy[0, index, 3])
+        while parent >= 0:
+            depth += 1
+            parent = int(hierarchy[0, parent, 3])
+        points = simplified.astype(float) + np.array([x1, y1])
+        polygons.append({"points": points.tolist(), "hole": bool(depth % 2)})
+    return {"polygons": polygons, "status": "observed_sam_mask"}
+
+
+def segmentation_overlays(masks, object_id, observed_frames, *, max_frames=600,
+                           max_total_vertices=50000):
+    """Bounded real observations only; interpolated/rejected samples have no mask."""
+    observed = set(map(int, observed_frames))
+    selected = sorted((m for m in masks if m.object_id == object_id and
+                       m.frame_index in observed and m.area), key=lambda m: m.frame_index)
+    frames, vertices, omitted = [], 0, 0
+    for mask in selected[:max_frames]:
+        contour = mask_contours(mask)
+        count = sum(len(p["points"]) for p in contour["polygons"])
+        if vertices + count > max_total_vertices:
+            contour = {"polygons": [], "status": "contour_budget_exceeded"}
+        if contour["status"] != "observed_sam_mask":
+            omitted += 1
+        else:
+            vertices += count
+        frames.append({"frame_idx": int(mask.frame_index), "source": "sam",
+                       "box": list(mask.box), **contour})
+    return {"frames": frames, "omitted_frames": max(0, len(selected)-max_frames),
+            "omitted_contours": omitted, "vertex_count": vertices,
+            "coordinate_system": "source_frame_pixels", "fill_rule": "evenodd",
+            "approximation": "Independent pixel-center boundaries simplified by at most 0.75 px; all components and holes retained. Budget overflow omits the whole contour, retaining its box."}
+
+
 def mask_moments(record: sam.SegmentationMaskRecord) -> MaskMoments:
     """Decode a box-local mask; central moments are unnormalized pixel sums.
 

@@ -3,7 +3,7 @@ import { API, format, request } from './api';
 import type { Analysis } from './api';
 
 export function Calibration({ analysis, onMetrics }: {
-  analysis: Analysis; onMetrics: (metrics: Record<string, number>) => void;
+  analysis: Analysis; onMetrics: (metrics: Record<string, number>, provenance: Analysis['quantity_provenance'], warnings: Analysis['scientific_warnings']) => void;
 }) {
   const [width, setWidth] = useState('');
   const [length, setLength] = useState('');
@@ -18,13 +18,14 @@ export function Calibration({ analysis, onMetrics }: {
     setError(''); setBusy(true);
     const timer = window.setTimeout(() => {
       const a = current.current.analysis;
-      request<{ inferred_physical_metrics: Record<string, number> }>('/api/calibrate', {
+      request<Pick<Analysis, 'inferred_physical_metrics' | 'quantity_provenance' | 'scientific_warnings'>>('/api/calibrate', {
         method: 'POST', signal: controller.signal, headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ analysis: { regime: a.regime, discovered_params: a.discovered_params,
+          selected_candidate: a.selected_candidate,
           pivot_or_bounds: a.pivot_or_bounds, inferred_physical_metrics: a.inferred_physical_metrics },
           known_object_width_cm: width === '' ? null : Number(width),
           known_length_cm: length === '' ? null : Number(length) }),
-      }).then(result => { if (!controller.signal.aborted) current.current.onMetrics(result.inferred_physical_metrics); })
+      }).then(result => { if (!controller.signal.aborted) current.current.onMetrics(result.inferred_physical_metrics, result.quantity_provenance, result.scientific_warnings); })
         .catch(e => { if (!controller.signal.aborted) setError(e instanceof Error ? e.message : 'Calibration failed'); })
         .finally(() => { if (!controller.signal.aborted) setBusy(false); });
     }, 250);
@@ -45,6 +46,22 @@ export function Calibration({ analysis, onMetrics }: {
     </div>
     <p role="status">{busy ? 'Updating calibration…' : metrics.g_measured_m_s2 != null ? 'Independent length scale applied.' : 'Enter a known width to measure gravity.'}{analysis.regime === 'pendulum' && ' Ruler check compares g/ω² (assuming 9.81) with your ruler length.'}</p>
     {error && <p className="inline-error" role="alert">{error}</p>}
+  </div>;
+}
+
+export function MeasurementIntegrity({ analysis }: { analysis: Analysis }) {
+  return <div className="calibration-panel"><h3>Parameter provenance &amp; identification</h3>
+    {analysis.scientific_warnings?.map(w => <p key={w.code} role="status">{w.message}</p>)}
+    <div className="table-scroll"><table><thead><tr><th>Quantity</th><th>Estimate</th><th>Source</th><th>Local uncertainty</th></tr></thead>
+      <tbody>{Object.entries({ ...analysis.discovered_params, ...analysis.inferred_physical_metrics }).map(([key, value]) => {
+        const uncertainty = analysis.parameter_uncertainty?.parameters[key];
+        const provenance = analysis.quantity_provenance?.[key];
+        const unresolved = uncertainty && uncertainty.status !== 'approximate_local';
+        return <tr key={key}><td>{key.replaceAll('_', ' ')}</td><td>{unresolved ? `Unresolved (fit ≈ ${format(value, 2)})` : format(value)}</td>
+          <td title={provenance?.source}>{provenance?.kind.replaceAll('_', ' ') ?? 'Not recorded'}</td>
+          <td>{uncertainty ? uncertainty.standard_error == null ? `Unavailable: ${uncertainty.status.replaceAll('_', ' ')}` : `Approx. SE ${uncertainty.standard_error.toPrecision(2)}` : 'Not estimated'}</td></tr>;
+      })}</tbody></table></div>
+    <p>{analysis.parameter_uncertainty?.limitations ?? 'Uncertainty was not recorded for this analysis.'}</p>
   </div>;
 }
 
