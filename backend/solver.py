@@ -313,7 +313,7 @@ def _fit_bounces(t, y, noise_scale):
     return sorted(results, key=lambda result: result.bic)
 
 
-def simulate_counterfactual(regime, params, initial_state, times):
+def simulate_counterfactual(regime, params, initial_state, times, *, accurate=False):
     """Return Nx2 (position, velocity) in radians or Cartesian pixels.
 
     g_scale multiplies the fitted acceleration. Pendulum omega0_squared is
@@ -335,7 +335,7 @@ def simulate_counterfactual(regime, params, initial_state, times):
         e = params.get("e", 0.8)
         if gravity <= 0 or not 0 <= e <= 1:
             raise ValueError("Invalid gravity or restitution")
-        return _bounce_states(t, gravity, e, params.get("floor", 0), state, events=False)
+        return _bounce_states(t, gravity, e, params.get("floor", 0), state, events=accurate)
     if regime == "pendulum":
         if params.get("L", 0.5) <= 0:
             raise ValueError("Pendulum length must be positive")
@@ -357,6 +357,13 @@ def simulate_counterfactual(regime, params, initial_state, times):
             return -gravity - c1 * v - c2 * abs(v) * v
     else:
         raise ValueError("Unknown regime")
+    if accurate and len(t) > 1:
+        solution = solve_ivp(lambda _t, s: [s[1], acceleration(*s)],
+                             (t[0], t[-1]), state, t_eval=t, method="RK45",
+                             rtol=1e-10, atol=1e-12)
+        if not solution.success or solution.y.shape[1] != len(t) or not np.all(np.isfinite(solution.y)):
+            raise ValueError("Simulation diverged")
+        return solution.y.T
     out = np.empty((len(t), 2))
     out[0] = state
     x, v = state
@@ -439,3 +446,95 @@ def calibrate_physical_metrics(analysis, known_object_width_cm=None, known_lengt
     elif regime != "bouncing_ball":
         metrics["calibration_gravity_m_s2"] = 9.81
     return metrics
+
+
+def mechanical_energy_diagnostics(regime, params, times, states, *, metrics=None,
+                                  release_index=0, empirical_states=None):
+    """Mass-specific energy of the selected law, with a fixed potential datum.
+
+    SI conversion scales *both* energy terms by length squared. Impact loss is
+    impulsive, so bounce power is zero between impacts, not a finite rate.
+    Linear pendulums use their matching harmonic (small-angle) potential.
+    """
+    metrics = metrics or {}
+    t = np.asarray(times, dtype=float)
+    states = np.asarray(states, dtype=float)
+    if regime == "pendulum":
+        length = metrics.get("L_meters", params.get("L"))
+        factor = length**2 if length is not None else 1.0
+        units = "J/kg" if length is not None else "rad²/s²"
+        frequency = params.get("omega0_squared", params.get("g", 9.81) / params.get("L", .5)) * params.get("g_scale", 1)
+        datum = params.get("theta_eq", 0)
+    else:
+        scale = metrics.get("meters_per_pixel", 1.0)
+        factor = scale**2
+        units = "J/kg" if "meters_per_pixel" in metrics else "px²/s²"
+        gravity = params.get("g_pixels", params.get("g", -params.get("constant", -9.81))) * params.get("g_scale", 1)
+        datum = params.get("floor", 0) if regime == "bouncing_ball" else float(states[release_index:, 0].min())
+
+    def series(values):
+        x, v = values.T
+        kinetic = .5 * v**2 * factor
+        if regime == "pendulum":
+            displacement = x - datum
+            potential = frequency * (0.5 * displacement**2 if params.get("linear", 0) else 1 - np.cos(displacement)) * factor
+            power = params.get("gamma", -params.get("velocity", 0)) * v**2 * factor
+        else:
+            height = np.maximum(0, x - datum) if regime == "bouncing_ball" else x - datum
+            potential = gravity * height * factor
+            power = (np.zeros_like(v) if regime == "bouncing_ball" else
+                     (params.get("c1", -params.get("velocity", 0)) * v**2 +
+                      params.get("c2", -params.get("quadratic_drag", 0)) * np.abs(v)**3) * factor)
+        return [{"t": float(time), "kinetic": float(k), "potential": float(p),
+                 "total": float(k + p), "dissipation_power": float(d)}
+                for time, k, p, d in zip(t, kinetic, potential, power)]
+
+    fitted = series(states)
+    initial, final = fitted[release_index]["total"], fitted[-1]["total"]
+    retained = 100 * final / initial if initial > np.finfo(float).eps else 100.0
+    return {"series": fitted, "empirical_series": series(np.asarray(empirical_states)) if empirical_states is not None else [],
+            "units": units, "energy_scale": float(factor), "power_units": "W/kg" if units == "J/kg" else f"{units}/s",
+            "t_release": float(t[release_index]), "t_end": float(t[-1]),
+            "energy_retained_pct": float(retained), "total_energy_dissipated_pct": float(100 - retained),
+            "potential_model": "harmonic" if regime == "pendulum" and params.get("linear", 0) else "mechanical",
+            "impact_loss_fraction": float(1 - params.get("e", 1)**2) if regime == "bouncing_ball" else None}
+
+
+def backfill_energy_diagnostics(analysis):
+    """Reconstruct smooth fitted states locally, including legacy cached fits.
+
+    Empirical derivatives use a uniform SG grid, then map back to exact PTS.
+    Pre-release observations are held; summary metrics cover free motion only.
+    """
+    points = analysis.get("trajectory_points", [])
+    if not points:
+        return analysis
+    times = np.array([p["t"] for p in points])
+    regime, params = analysis["regime"], analysis["discovered_params"]
+    geometry = analysis["pivot_or_bounds"]
+    release_time = analysis.get("release_time", geometry.get("release_time", times[0]))
+    release = int(np.searchsorted(times, release_time))
+    active_times = np.unique(np.r_[release_time, times[release:]])
+    fitted = simulate_counterfactual(regime, params, analysis["initial_state"], active_times, accurate=True)
+    states = np.tile(analysis["initial_state"], (len(times), 1)).astype(float)
+    states[:release, 1] = 0
+    states[release:] = fitted[np.searchsorted(active_times, times[release:])]
+    y = geometry["frame_height"] - np.array([p["y_px"] for p in points])
+    if regime == "pendulum":
+        x = np.array([p["x_px"] for p in points])
+        y = np.unwrap(np.arctan2(x - geometry.get("x0", 0), geometry.get("y0", 0) - y))
+    empirical = np.column_stack((y, np.zeros(len(y))))
+    # Do not smooth the release transient into free-motion derivatives.
+    for start, stop in ((0, release), (release, len(times))):
+        n = stop - start
+        if n < 5:
+            continue
+        grid = np.linspace(times[start], times[stop - 1], n)
+        values = np.interp(grid, times[start:stop], y[start:stop])
+        window = min(15, n if n % 2 else n - 1)
+        empirical[start:stop, 0] = np.interp(times[start:stop], grid, savgol_filter(values, window, 3))
+        empirical[start:stop, 1] = np.interp(times[start:stop], grid, savgol_filter(values, window, 3, deriv=1, delta=grid[1] - grid[0]))
+    analysis["energy_diagnostics"] = mechanical_energy_diagnostics(
+        regime, params, times, states, metrics=analysis.get("inferred_physical_metrics"),
+        release_index=release, empirical_states=empirical)
+    return analysis

@@ -6,8 +6,15 @@ export interface Point {
   x_px?: number; y_px?: number; is_heldout?: boolean; is_pre_release?: boolean;
 }
 export interface Phase { position: number; velocity: number }
-export interface Simulation { trajectory_points: Point[]; phase_space: Phase[]; phase_units: string }
+export interface EnergyPoint { t: number; kinetic: number; potential: number; total: number; dissipation_power: number }
+export interface EnergyDiagnostics {
+  series: EnergyPoint[]; empirical_series: EnergyPoint[]; units: string; energy_scale: number;
+  energy_retained_pct: number; total_energy_dissipated_pct: number;
+  t_release: number; t_end: number; potential_model: string; impact_loss_fraction: number | null;
+}
+export interface Simulation { energy_diagnostics: EnergyDiagnostics; trajectory_points: Point[]; phase_space: Phase[]; phase_units: string }
 export interface Analysis {
+  energy_diagnostics: EnergyDiagnostics;
   regime: Regime;
   video_sha256: string;
   video_url?: string;
@@ -70,7 +77,7 @@ export function simulate(analysis: Analysis, controls: Controls, signal: AbortSi
   return request<Simulation>('/api/counterfactual', {
     method: 'POST', signal, headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ regime: analysis.regime, params, initial_state: analysis.initial_state,
-      pivot_or_bounds: analysis.pivot_or_bounds, frames, fps }),
+      pivot_or_bounds: analysis.pivot_or_bounds, inferred_physical_metrics: analysis.inferred_physical_metrics, frames, fps }),
   });
 }
 export function observationStart(analysis: Analysis) {

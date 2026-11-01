@@ -16,7 +16,7 @@ from openai import APIError
 from pydantic import BaseModel, ConfigDict, Field
 
 from backend.agent import analyze_video
-from backend.solver import simulate_counterfactual, calibrate_physical_metrics
+from backend.solver import simulate_counterfactual, calibrate_physical_metrics, mechanical_energy_diagnostics
 from backend.cache import CACHE_DIR
 
 DEMO_DIR = Path(__file__).resolve().parent / "demo_clips"
@@ -113,6 +113,7 @@ class CounterfactualRequest(BaseModel):
     pivot_or_bounds: dict[str, float]
     fps: float = Field(default=30, gt=0, le=240)
     frames: int = Field(default=120, ge=2, le=3600)
+    inferred_physical_metrics: dict[str, float] = Field(default_factory=dict)
 
 
 @app.post("/api/counterfactual")
@@ -132,7 +133,7 @@ def counterfactual(request: CounterfactualRequest):
         active = times >= release_time
         # Include the exact release instant even when it falls between grid samples.
         active_times = np.unique(np.r_[release_time, times[active]])
-        fitted = simulate_counterfactual(request.regime, params, request.initial_state, active_times)
+        fitted = simulate_counterfactual(request.regime, params, request.initial_state, active_times, accurate=True)
         states = np.tile(request.initial_state, (len(times), 1)).astype(float)
         states[~active, 1] = 0.0
         states[active] = fitted[np.searchsorted(active_times, times[active])]
@@ -151,7 +152,10 @@ def counterfactual(request: CounterfactualRequest):
                                     "pred_x_px": float(x[i]), "pred_y_px": float(y[i])}
                                    for i in range(request.frames)],
             "phase_space": [{"position": float(p), "velocity": float(v)} for p, v in states],
-            "phase_units": "radians" if request.regime == "pendulum" else "pixels"}
+            "phase_units": "radians" if request.regime == "pendulum" else "pixels",
+            "energy_diagnostics": mechanical_energy_diagnostics(
+                request.regime, params, times, states, metrics=request.inferred_physical_metrics,
+                release_index=int(np.searchsorted(times, release_time)))}
 
 
 class StoredAnalysis(BaseModel):

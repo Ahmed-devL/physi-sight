@@ -306,3 +306,17 @@ footer>span { display: flex; align-items: center; gap: 8px; flex-wrap: wrap }
 .calibration-inputs input { padding: 10px 12px; border: 1px solid #aaa99d; border-radius: 4px; background: #fffdf6; width: 100%; }
 .export-buttons button { padding: 10px 14px; border: 1px solid #687d31; border-radius: 4px; background: #f2f4e9; color: #34421a; cursor: pointer; }
 .export-buttons button:disabled { opacity: .5; cursor: wait; }
+
+.energy-diagnostics { border-top: 1px solid var(--border, #d8c7b4); margin-top: 24px; padding-top: 24px; }
+.energy-diagnostics h3 { font-size: 18px; margin: 0 0 16px; }
+.energy-diagnostics h3 span { display: inline-block; font-family: monospace; color: #912f46; }
+.energy-pills { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
+.energy-pills > span { border: 1px solid #d8c7b4; border-radius: 20px; padding: 8px 12px; font-size: 12px; }
+.energy-pills strong { color: #912f46; margin-left: 6px; }
+.energy-stage { min-height: 310px; }
+.diagnostics-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 24px; }
+.diagnostics-grid > * { min-width: 0; }
+@media (min-width: 1200px) {
+  .diagnostics-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: end; }
+  .energy-diagnostics { border-top: 0; margin-top: 0; padding-top: 0; }
+}

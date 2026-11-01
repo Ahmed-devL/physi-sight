@@ -309,3 +309,72 @@ def test_constant_heldout_r2_is_finite():
     wrong = _score('constant', {}, (0., 0.), np.zeros(20), y, 14, 2, {})
     assert perfect.heldout_r2 == 1.0
     assert wrong.heldout_r2 == 0.0
+
+
+def test_undamped_pendulum_energy_is_conserved():
+    from backend.solver import mechanical_energy_diagnostics
+    times = np.arange(240) / 30
+    params = {'omega0_squared': 19.62, 'gamma': 0, 'theta_eq': .12}
+    states = simulate_counterfactual('pendulum', params, [1.3, .4], times)
+    result = mechanical_energy_diagnostics('pendulum', params, times, states,
+                                           metrics={'L_meters': .5})
+    total = np.array([p['total'] for p in result['series']])
+    assert np.ptp(total) / total[0] < .01
+    np.testing.assert_allclose(total, [p['kinetic'] + p['potential'] for p in result['series']])
+    assert all(p['dissipation_power'] == 0 for p in result['series'])
+
+
+@pytest.mark.parametrize('regime', ['pendulum', 'drag_fall', 'bouncing_ball'])
+def test_dissipative_mechanical_energy_and_counterfactual(regime):
+    from backend.solver import mechanical_energy_diagnostics
+    data = analysis(regime)
+    times = np.arange(120) / 30
+    params = data['discovered_params']
+    states = simulate_counterfactual(regime, params, data['initial_state'], times)
+    metrics = calibrate_physical_metrics(data, 20)
+    result = mechanical_energy_diagnostics(regime, params, times, states, metrics=metrics)
+    energy = np.array([p['total'] for p in result['series']])
+    assert np.all(np.diff(energy) <= energy[0] * 1e-7)
+    assert 0 <= result['energy_retained_pct'] < 100
+    assert result['energy_retained_pct'] + result['total_energy_dissipated_pct'] == pytest.approx(100)
+    assert all(p['dissipation_power'] >= 0 for p in result['series'])
+    if regime == 'bouncing_ball':
+        drops = np.diff(energy) < -energy[0] * 1e-6
+        np.testing.assert_allclose(energy[1:][drops] / energy[:-1][drops], params['e']**2, atol=1e-7)
+    response = TestClient(app).post('/api/counterfactual', json={
+        'regime': regime, 'params': params, 'initial_state': data['initial_state'],
+        'pivot_or_bounds': {**data['pivot_or_bounds'], 'x0': 100, 'y0': 600},
+        'inferred_physical_metrics': metrics, 'frames': 120})
+    assert response.status_code == 200, response.text
+    assert response.json()['energy_diagnostics']['units'] == 'J/kg'
+    np.testing.assert_allclose([p['total'] for p in response.json()['energy_diagnostics']['series']], energy)
+
+
+@pytest.mark.parametrize('regime,clip', [
+    ('pendulum', 'damped_pendulum.mp4'), ('drag_fall', 'falling_drag_sphere.mp4'),
+    ('bouncing_ball', 'bouncing_ball.mp4'), ('pendulum', 'youtube_pendulum.mp4')])
+def test_cached_demo_backfills_energy_without_live_calls(tmp_path, monkeypatch, regime, clip):
+    from unittest.mock import AsyncMock
+    import backend.agent as agent
+    import backend.app as api
+    from backend.cache import DiskCache, video_sha256
+    data = analysis(regime)
+    data['fit_version'] = 3
+    data['release_time'] = .2
+    data['pivot_or_bounds']['release_time'] = .2
+    cache = DiskCache(tmp_path)
+    grounding = {'regime': regime, 'object_prompt': 'ball'}
+    cache.update(video_sha256(api.DEMO_DIR / clip), grounding=grounding, analyses={'meta': data})
+    monkeypatch.setattr(agent, 'DiskCache', lambda: cache)
+    for name in ('ground_scene', 'track_video', 'hypothesis_loop'):
+        monkeypatch.setattr(agent, name, AsyncMock(side_effect=AssertionError('Unexpected live model call')))
+    response = TestClient(app).post('/api/analyze/demo/' + clip)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload['cache_hit']
+    result = payload['energy_diagnostics']
+    assert len(result['series']) == len(data['trajectory_points'])
+    assert len(result['empirical_series']) == len(result['series'])
+    assert result['t_release'] == pytest.approx(.2)
+    assert all(np.isfinite(p[k]) for p in result['series'] + result['empirical_series']
+               for k in ('t', 'kinetic', 'potential', 'total', 'dissipation_power'))

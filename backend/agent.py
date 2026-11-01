@@ -24,7 +24,7 @@ from backend.kinematics import (
     select_primary_track, mask_size_metrics, normalize_video, is_normalized_video, detect_release_index,
     find_active_motion_window,
 )
-from backend.solver import fit_trajectory, calibrate_physical_metrics
+from backend.solver import fit_trajectory, calibrate_physical_metrics, backfill_energy_diagnostics
 
 ROOT = Path(__file__).resolve().parents[1]
 REGIMES = {"pendulum", "drag_fall", "bouncing_ball"}
@@ -226,14 +226,14 @@ def fit_observations(masks, metadata, regime):
                "pred_y_px": float(pred_y), "is_pre_release": i < release, "is_heldout": i >= split}
               for i, (frame, t, xp, yp, pred_x, pred_y) in
               enumerate(zip(indices, times, x, y, px, py))]
-    return {"latex_equation": equation, "regime": regime, "discovered_params": params,
+    return backfill_energy_diagnostics({"latex_equation": equation, "regime": regime, "discovered_params": params,
             "inferred_physical_metrics": {**metrics, **mask_size_metrics(masks, track)}, "train_r2": train_r2,
             "heldout_r2": _finite(best.heldout_r2), "heldout_rmse": best.heldout_rmse,
             "metric_units": "radians" if regime == "pendulum" else "pixels",
             "candidate_comparison_table": table, "trajectory_points": points,
             "initial_state": list(best.initial_state), "pivot_or_bounds": geometry,
             "selected_candidate": best.name, "release_frame_idx": int(indices[release]),
-            "release_time": float(times[release]), "fit_version": 3}
+            "release_time": float(times[release]), "fit_version": 3})
 
 
 def _finite(value):
@@ -313,11 +313,11 @@ async def analyze_video(video_path, *, force_live=False, model_provider="meta", 
     result = await _analyze_video(path, force_live=force_live, model_provider=model_provider,
                                   cache=cache, regime=regime, object_prompt=object_prompt)
     metrics = calibrate_physical_metrics(result, known_object_width_cm, known_length_cm)
-    return {**result, "inferred_physical_metrics": metrics,
+    return backfill_energy_diagnostics({**result, "inferred_physical_metrics": metrics,
             "video_metadata": {**result.get("video_metadata", {}),
                                **({"trim_window_seconds": list(trim_window_seconds)}
                                   if trim_window_seconds is not None else {})},
-            **({"video_url": video_url} if video_url else {})}
+            **({"video_url": video_url} if video_url else {})})
 
 
 async def _analyze_video(video_path, *, force_live=False, model_provider="meta", cache=None,

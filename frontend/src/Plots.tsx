@@ -196,3 +196,91 @@ export function PhasePortrait({ analysis, baseline, simulation, videoRef, showGh
   });
   return <canvas ref={ref} className="phase-canvas" role="img" aria-label="Position versus velocity phase portrait. The playhead follows the video; the dashed curve shows the counterfactual." />;
 }
+
+export function EnergyChart({ analysis, simulation, showGhost, videoRef }: {
+  analysis: Analysis | null; simulation: Simulation | null; showGhost: boolean;
+  videoRef: RefObject<HTMLVideoElement | null>;
+}) {
+  const diagnostics = analysis?.energy_diagnostics;
+  const metrics = analysis?.inferred_physical_metrics;
+  // Calibration changes only the common squared-length multiplier; no refit.
+  const calibrated = analysis?.regime === 'pendulum' ? metrics?.L_meters != null : metrics?.meters_per_pixel != null;
+  const scale = analysis?.regime === 'pendulum' ? (metrics?.L_meters ?? 1) ** 2 : (metrics?.meters_per_pixel ?? 1) ** 2;
+  const ratio = scale / (diagnostics?.energy_scale ?? 1);
+  const ref = useCanvas((ctx, width, height) => {
+    if (!analysis || !diagnostics?.series.length) return;
+    const points = diagnostics.series;
+    const left = 76, top = 38, w = width - left - 26, h = height - top - 64;
+    const first = points[0].t, last = points.at(-1)!.t;
+    const ghost = showGhost ? simulation?.energy_diagnostics : undefined;
+    const ghostRatio = scale / (ghost?.energy_scale ?? 1);
+    const maximum = Math.max(1e-12, ...points.map(p => p.total * ratio), ...(ghost?.series.map(p => p.total * ghostRatio) ?? [])) * 1.08;
+    const x = (t: number) => left + (t - first) / (last - first || 1) * w;
+    const y = (e: number) => top + h - e / maximum * h;
+    ctx.font = '12px "JetBrains Mono", monospace';
+    for (let i = 0; i <= 4; i++) {
+      const yy = top + h * i / 4, xx = left + w * i / 4;
+      ctx.strokeStyle = '#D8C7B4'; ctx.lineWidth = 1; ctx.beginPath();
+      ctx.moveTo(left, yy); ctx.lineTo(left + w, yy); ctx.stroke();
+      ctx.fillStyle = '#4A4238'; ctx.textAlign = 'right';
+      ctx.fillText((maximum * (1 - i / 4)).toPrecision(3), left - 8, yy + 4);
+      ctx.textAlign = 'center'; ctx.fillText((first + (last - first) * i / 4).toFixed(2), xx, top + h + 23);
+    }
+    ctx.textAlign = 'left'; ctx.fillText(`Specific energy [${calibrated ? 'J/kg' : analysis.regime === 'pendulum' ? 'rad²/s²' : 'px²/s²'}]`, left, 18);
+    ctx.textAlign = 'center'; ctx.fillText('Time [s]', left + w / 2, height - 10);
+    ctx.save(); ctx.beginPath(); ctx.rect(left, top, w, h); ctx.clip();
+    const split = analysis.trajectory_points.find(p => p.is_heldout)?.t;
+    if (split != null) {
+      ctx.fillStyle = '#687D3110'; ctx.fillRect(x(split), top, x(last) - x(split), h);
+      ctx.strokeStyle = '#807264'; ctx.setLineDash([5, 4]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x(split), top); ctx.lineTo(x(split), top + h); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = '#4A4238'; ctx.textAlign = 'right'; ctx.fillText('70% | 30%', x(split) - 5, top + 15);
+    }
+    const colors = { kinetic: '#BC870C', potential: '#548778', total: '#912F46' };
+    for (const key of ['kinetic', 'potential', 'total'] as const) {
+      ctx.beginPath(); ctx.strokeStyle = colors[key]; ctx.lineWidth = key === 'total' ? 3 : 1.8;
+      points.forEach((p, i) => {
+        if (i) {
+          if (analysis.regime === 'bouncing_ball' && key === 'total') ctx.lineTo(x(p.t), y(points[i - 1].total * ratio));
+          ctx.lineTo(x(p.t), y(p[key] * ratio));
+        } else ctx.moveTo(x(p.t), y(p[key] * ratio));
+      });
+      ctx.stroke();
+    }
+    if (ghost) {
+      ctx.beginPath(); ctx.strokeStyle = GOLD; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+      ghost.series.forEach((p, i) => { if (i) ctx.lineTo(x(p.t), y(p.total * ghostRatio)); else ctx.moveTo(x(p.t), y(p.total * ghostRatio)); });
+      ctx.stroke(); ctx.setLineDash([]);
+    }
+    const time = (videoRef.current?.currentTime ?? 0) - observationStart(analysis);
+    if (time >= first && time <= last) {
+      ctx.strokeStyle = '#4A423899'; ctx.lineWidth = 1; ctx.beginPath();
+      ctx.moveTo(x(time), top); ctx.lineTo(x(time), top + h); ctx.stroke();
+      let a = 0, b = points.length - 1;
+      while (b - a > 1) { const mid = (a + b) >>> 1; if (points[mid].t <= time) a = mid; else b = mid; }
+      const f = (time - points[a].t) / (points[b].t - points[a].t || 1);
+      for (const key of ['kinetic', 'potential', 'total'] as const) {
+        // Bounce energy is discontinuous; avoid interpolating across an impact.
+        const value = analysis.regime === 'bouncing_ball' && key === 'total' ? points[a][key]
+          : points[a][key] + f * (points[b][key] - points[a][key]);
+        dot(ctx, x(time), y(value * ratio), colors[key], 3);
+      }
+    }
+    ctx.restore();
+  });
+  const mechanism = analysis?.regime === 'pendulum' ? 'Damping' : analysis?.regime === 'drag_fall' ? 'Drag' : 'Impact';
+  return <div className="energy-diagnostics">
+    <h3>Mechanical Energy &amp; Hamiltonian Decay <span>E(t) = T + V</span></h3>
+    <div className="energy-pills">
+      <span>Energy Retained <strong>{diagnostics ? diagnostics.energy_retained_pct.toFixed(2) : '—'}%</strong></span>
+      <span>Dissipated by {mechanism} <strong>{diagnostics ? diagnostics.total_energy_dissipated_pct.toFixed(2) : '—'}%</strong></span>
+    </div>
+    <div className="phase-legend"><span style={{color: '#BC870C'}}>● Kinetic T(t)</span><span style={{color: '#548778'}}>● Potential V(t)</span><span style={{color: '#912F46'}}>● Total E(t)</span>{showGhost && simulation && <span>┄ Counterfactual E(t)</span>}</div>
+    <div className="phase-stage energy-stage"><canvas ref={ref} className="phase-canvas" role="img" aria-label="Kinetic, potential and total mechanical energy against time, with held-out split and video-synchronized playhead" />{!diagnostics && <div className="plot-empty">Energy curves appear after analysis</div>}</div>
+    {analysis && diagnostics && <p className="calibration-note">{analysis.regime === 'bouncing_ball'
+      ? `Each impact loses ${(100 * (diagnostics.impact_loss_fraction ?? 0)).toFixed(1)}% of energy (1 − e²); energy is constant during flight. Impact loss is impulsive.`
+      : analysis.regime === 'pendulum'
+        ? `dE/dt = −γ(Lω)². The small-angle, cycle-averaged envelope follows exp(−γt), γ = ${analysis.discovered_params.gamma.toFixed(3)} s⁻¹.${diagnostics.potential_model === 'harmonic' ? ' The selected linear law uses harmonic potential.' : ''}`
+        : 'Aerodynamic drag does negative work: dE/dt = −(c₁v² + c₂|v|³). Height is referenced to the lowest fitted trajectory point.'} Percentages cover release to end. Empirical SG energy estimates are included in the analysis data.</p>}
+  </div>;
+}
