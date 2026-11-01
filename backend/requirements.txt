@@ -9,3 +9,5 @@ uvicorn
 opencv-python
 python-dotenv
 pytest
+httpx
+python-multipart

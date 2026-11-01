@@ -1,0 +1,298 @@
+"""Offline regime recovery and API integration; no model/network calls."""
+import asyncio
+from pathlib import Path
+from time import perf_counter
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+from fastapi.testclient import TestClient
+import numpy as np
+import pytest
+
+from backend import agent
+from backend import app as api
+from backend.cache import DiskCache, video_sha256
+from backend.kinematics import MaskMoments
+from backend.solver import fit_trajectory, integrate, simulate_counterfactual
+
+
+@pytest.mark.parametrize("regime,terms,coefficients,name", [
+    ("pendulum", ("position",), (-19.62,), "simple_harmonic"),
+    ("pendulum", ("sin_position", "velocity"), (-19.62, -.25), "nonlinear_pendulum"),
+    ("drag_fall", ("constant",), (-9.81,), "free_fall"),
+    ("drag_fall", ("constant", "velocity"), (-9.81, -.5), "linear_drag"),
+    ("drag_fall", ("constant", "quadratic_drag"), (-9.81, -.25), "quadratic_drag"),
+])
+def test_physical_candidate_selection(regime, terms, coefficients, name):
+    t = np.arange(120) / 30
+    initial = (.9, 0) if regime == "pendulum" else (12, 0)
+    clean = integrate(t, terms, coefficients, initial)
+    observed = clean + np.random.default_rng(4).normal(0, .0005, len(t))
+    results = fit_trajectory(t, observed, regime=regime, noise_scale=.0005)
+    best = results[0]
+    assert best.name == name
+    for term, coefficient in zip(terms, coefficients):
+        assert best.coefficients[term] == pytest.approx(coefficient, rel=.03)
+    assert best.heldout_r2 > .99
+    assert best.train_size == 84
+    # Changing the held-out observations must never alter model selection.
+    observed[84:] += 100
+    changed = fit_trajectory(t, observed, regime=regime, noise_scale=.0005)
+    assert [(r.name, r.coefficients, r.bic) for r in changed] == [
+        (r.name, r.coefficients, r.bic) for r in results]
+
+
+def _independent_ballistic(times, g=1569.6, e=.82, floor=59., y0=443.):
+    """Independent scalar impact simulator for checking the event solver."""
+    output = []
+    for t in times:
+        y, v, remaining = y0, 0., float(t)
+        while remaining > 0:
+            flight = (v + np.sqrt(v*v + 2*g*(y-floor))) / g
+            if remaining <= flight:
+                y += v * remaining - .5*g*remaining**2
+                break
+            remaining -= flight
+            v = e * np.sqrt(v*v + 2*g*(y-floor))
+            y = floor
+        output.append(y)
+    return np.array(output)
+
+
+def test_bounce_recovery_and_training_only():
+    t = np.arange(120) / 30
+    raw = _independent_ballistic(t) + np.random.default_rng(42).normal(0, .05, len(t))
+    best = fit_trajectory(t, raw, regime="bouncing_ball", noise_scale=.05)[0]
+    assert best.name == "inelastic_bounces"
+    assert best.coefficients["g_pixels"] == pytest.approx(1569.6, rel=.01)
+    assert best.coefficients["e"] == pytest.approx(.82, rel=.01)
+    assert best.heldout_r2 > .999
+    changed = raw.copy()
+    changed[84:] += 100
+    after = fit_trajectory(t, changed, regime="bouncing_ball", noise_scale=.05)[0]
+    assert best.coefficients == after.coefficients
+    np.testing.assert_array_equal(best.prediction, after.prediction)
+    with pytest.raises(ValueError, match="bounce"):
+        fit_trajectory(t, 10000 - t*t, regime="bouncing_ball")
+
+
+@pytest.mark.parametrize("regime,params,state", [
+    ("pendulum", {"omega0_squared": 19.62, "gamma": .25}, [.9, 0]),
+    ("drag_fall", {"g_pixels": 255.06, "c2": .025}, [467, 0]),
+    ("bouncing_ball", {"g_pixels": 1569.6, "e": .82, "floor": 59}, [443, 0]),
+])
+def test_counterfactual_accuracy_and_speed(regime, params, state):
+    times = np.arange(120) / 30
+    simulation = simulate_counterfactual(regime, params, state, times)
+    if regime == "pendulum":
+        reference = integrate(times, ("sin_position", "velocity"), (-19.62, -.25), state)
+    elif regime == "drag_fall":
+        reference = integrate(times, ("constant", "quadratic_drag"), (-255.06, -.025), state)
+    else:
+        reference = _independent_ballistic(times)
+    np.testing.assert_allclose(simulation[:, 0], reference, atol=1e-4)
+    durations = []
+    for _ in range(5):
+        start = perf_counter()
+        simulate_counterfactual(regime, params, state, times)
+        durations.append(perf_counter() - start)
+    assert np.median(durations) < .010
+    modified = simulate_counterfactual(regime, {**params, "g_scale": .5}, state, times)
+    assert np.max(np.abs(simulation[:, 0] - modified[:, 0])) > .1
+
+
+def test_disk_cache_content_addressing_and_atomic_sections(tmp_path):
+    cache = DiskCache(tmp_path / "cache")
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"same-video")
+    digest = video_sha256(source)
+    cache.update(digest, masks=[{"mask": "bits"}], analyses={"meta": {"score": 1}})
+    cache.update(digest, analyses={"baseten": {"score": 2}})
+    result = cache.load(digest)
+    assert result["masks"] == [{"mask": "bits"}]
+    assert set(result["analyses"]) == {"meta", "baseten"}
+    with pytest.raises(ValueError):
+        cache.load("../escape")
+    (cache.directory / f"{digest}.json").write_text("partial write")
+    assert cache.load(digest) == {}
+
+
+def _fixture_masks(regime):
+    t = np.arange(120) / 30
+    if regime == "pendulum":
+        theta = integrate(t, ("sin_position", "velocity"), (-19.62, -.15), (.9, 0))
+        x = 256 + 280 * np.sin(theta)
+        screen_y = 48 + 280 * np.cos(theta)
+    elif regime == "drag_fall":
+        y = integrate(t, ("constant", "quadratic_drag"), (-255.06, -.025), (467, 0))
+        x, screen_y = np.full(120, 256), 512 - y
+    else:
+        x, screen_y = np.full(120, 256), 512 - _independent_ballistic(t)
+    return [MaskMoments("1", i, (0, 0, 0, 0), np.ones((1, 1), dtype=np.uint8),
+                        1, float(x[i]), float(screen_y[i]), None, 0, 0, 0)
+            for i in range(120)]
+
+
+@pytest.mark.parametrize("regime,clip", [
+    ("pendulum", "damped_pendulum.mp4"),
+    ("drag_fall", "falling_drag_sphere.mp4"),
+    ("bouncing_ball", "bouncing_ball.mp4"),
+])
+def test_agent_pipeline_cache_force_and_provider(tmp_path, monkeypatch, regime, clip):
+    cache = DiskCache(tmp_path)
+    ground = AsyncMock(return_value={"regime": regime, "object_prompt": "ball"})
+    track = AsyncMock(return_value=_fixture_masks(regime))
+    hypotheses = AsyncMock(return_value=[
+        {"step": 1, "plain_english_explanation": "Baseline tested"},
+        {"step": 2, "plain_english_explanation": "Dissipation improves forecast"},
+    ])
+    monkeypatch.setattr(agent, "ground_scene", ground)
+    monkeypatch.setattr(agent, "track_video", track)
+    monkeypatch.setattr(agent, "hypothesis_loop", hypotheses)
+    path = api.DEMO_DIR / clip
+
+    async def run():
+        result = await agent.analyze_video(path, cache=cache)
+        assert result["heldout_r2"] > .999
+        assert result["train_r2"] > .999
+        assert len(result["reasoning_steps"]) == 2
+        assert result["background_image"].startswith("data:image/png;base64,")
+        assert len(result["trajectory_points"]) == 120
+        assert sum(p["is_heldout"] for p in result["trajectory_points"]) == 36
+        assert result["cache_hit"] is False
+        cached = await agent.analyze_video(path, cache=cache)
+        assert cached["cache_hit"] is True
+        assert cached["model_api_cost_usd"] == 0
+        assert cached["discovered_params"] == result["discovered_params"]
+        assert (ground.await_count, track.await_count, hypotheses.await_count) == (1, 1, 1)
+        await agent.analyze_video(path, cache=cache, model_provider="baseten")
+        assert (ground.await_count, track.await_count, hypotheses.await_count) == (1, 1, 2)
+        await agent.analyze_video(path, cache=cache, force_live=True)
+        assert (ground.await_count, track.await_count, hypotheses.await_count) == (2, 2, 3)
+        # The public counterfactual API round-trips the inferred geometry/units.
+        response = TestClient(api.app).post("/api/counterfactual", json={
+            "regime": regime, "params": result["discovered_params"],
+            "initial_state": result["initial_state"], "pivot_or_bounds": result["pivot_or_bounds"],
+            "frames": 120, "fps": 30})
+        assert response.status_code == 200, response.text
+        predicted = response.json()["trajectory_points"]
+        np.testing.assert_allclose([p["pred_y_px"] for p in predicted],
+                                   [p["pred_y_px"] for p in result["trajectory_points"]], atol=.001)
+    asyncio.run(run())
+
+
+def test_demo_static_analysis_upload_and_errors(tmp_path, monkeypatch):
+    client = TestClient(api.app)
+    listing = client.get("/api/demos")
+    assert listing.status_code == 200
+    assert len(listing.json()["clips"]) == 3
+    assert client.get(listing.json()["clips"][0]["url"]).status_code == 200
+    captured = []
+    async def fake_analyze(path, **kwargs):
+        assert Path(path).exists()
+        captured.append((Path(path), kwargs))
+        return {"regime": "pendulum", "heldout_r2": .999996}
+    mocked = AsyncMock(side_effect=fake_analyze)
+    monkeypatch.setattr(api, "analyze_video", mocked)
+    response = client.post("/api/analyze/demo/damped_pendulum.mp4?force_live=true&model_provider=baseten")
+    assert response.status_code == 200
+    assert captured[-1][1] == {"force_live": True, "model_provider": "baseten"}
+    assert client.post("/api/analyze/demo/missing.mp4").status_code == 404
+    assert client.post("/api/analyze/demo/damped_pendulum.mp4?model_provider=bad").status_code == 422
+    response = client.post("/api/analyze/upload", files={"file": ("test.mp4", b"test", "video/mp4")})
+    assert response.status_code == 200
+    assert not captured[-1][0].exists()
+    assert client.post("/api/analyze/upload", files={"file": ("test.txt", b"x")}).status_code == 415
+    assert client.post("/api/analyze/upload", files={"file": ("test.mp4", b"")}).status_code == 422
+    monkeypatch.setattr(api, "MAX_UPLOAD_BYTES", 1)
+    assert client.post("/api/analyze/upload", files={"file": ("test.mp4", b"xx")}).status_code == 413
+    mocked.side_effect = ValueError("Cannot decode MP4 video")
+    assert client.post("/api/analyze/demo/damped_pendulum.mp4").status_code == 422
+    mocked.side_effect = RuntimeError("missing API key")
+    assert client.post("/api/analyze/demo/damped_pendulum.mp4").status_code == 503
+    cors = client.options("/api/counterfactual", headers={
+        "Origin": "http://localhost:5173", "Access-Control-Request-Method": "POST"})
+    assert cors.headers["access-control-allow-origin"] == "http://localhost:5173"
+
+
+def test_counterfactual_validation():
+    client = TestClient(api.app)
+    body = {"regime": "pendulum", "params": {"omega0_squared": 19.62},
+            "initial_state": [.9, 0], "pivot_or_bounds": {"x0": 256, "y0": 464,
+            "radius": 280, "frame_height": 512}, "frames": 120, "fps": 30}
+    response = client.post("/api/counterfactual", json=body)
+    assert response.status_code == 200
+    assert len(response.json()["phase_space"]) == 120
+    assert response.json()["trajectory_points"][0]["pred_y_px"] == pytest.approx(48 + 280*np.cos(.9))
+    for change in ({"frames": 0}, {"fps": 0}, {"regime": "bad"}, {"initial_state": [0]},
+                   {"params": {"gamma": -1}}, {"pivot_or_bounds": {}}):
+        assert client.post("/api/counterfactual", json={**body, **change}).status_code == 422
+
+
+def _response(content):
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+
+def test_two_step_hypothesis_loop_uses_real_scores(monkeypatch):
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+    client.chat.completions.create = AsyncMock(return_value=_response(
+        '{"hypothesis":"drag","evidence":"BIC and RMSE","conclusion":"supported",'
+        '"plain_english_explanation":"Drag limits speed"}'))
+    monkeypatch.setattr(agent, "_hypothesis_client", lambda p: (client, "test-model"))
+    evidence = {"regime": "drag_fall", "selected_candidate": "quadratic_drag", "discovered_params": {},
+                "candidate_comparison_table": [{"name": "free_fall", "bic": 10, "heldout_rmse": 3}],
+                "inferred_physical_metrics": {}, "metric_units": "pixels"}
+    result = asyncio.run(agent.hypothesis_loop(evidence, "meta"))
+    assert len(result) == 2
+    assert client.chat.completions.create.await_count == 2
+    assert "\"heldout_rmse\": 3" in client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+
+
+def test_grounding_fallback_and_sam_wire_contract(monkeypatch):
+    import httpx
+    from openai import NotFoundError
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+    client.chat.completions.create = AsyncMock(side_effect=[
+        NotFoundError("model unavailable", response=httpx.Response(404, request=httpx.Request("POST", "https://example.test")), body=None),
+        _response('{"regime":"bouncing_ball","object_prompt":"ball"}'),
+    ])
+    stream = MagicMock()
+    stream.__aenter__ = AsyncMock(return_value=stream)
+    stream.__aexit__ = AsyncMock(return_value=None)
+    client.responses.create = AsyncMock(return_value=stream)
+    monkeypatch.setattr(agent, "_meta_client", lambda: client)
+    parser = AsyncMock(return_value=[])
+    monkeypatch.setattr(agent, "parse_sam_video", parser)
+    async def run():
+        result = await agent.ground_scene("unused", ["frame0", "frame15"])
+        assert result == {"regime": "bouncing_ball", "object_prompt": "ball"}
+        assert [call.kwargs["model"] for call in client.chat.completions.create.call_args_list] == [
+            "muse-spark-1.3-contributor", "muse-spark-1.3"]
+        await agent.track_video(api.DEMO_DIR / "bouncing_ball.mp4", "ball")
+        kwargs = client.responses.create.call_args.kwargs
+        assert kwargs["model"] == "sam-3.1"
+        assert kwargs["stream"] is True
+        assert kwargs["metadata"] == {"mask_encoding": "one_bit"}
+        assert kwargs["input"][0]["content"][0]["text"] == "ball"
+        parser.assert_awaited_once_with(stream)
+        client.chat.completions.create.side_effect = None
+        client.chat.completions.create.return_value = _response(
+            '{"regime":"drag_fall","object_prompt":"segment ball and floor"}')
+        with pytest.raises(ValueError, match="noun phrase"):
+            await agent.ground_scene("unused", ["frame0", "frame15"])
+    asyncio.run(run())
+
+
+def test_baseten_configuration(monkeypatch):
+    monkeypatch.setenv("BASETEN_API_KEY", "unit-test-placeholder")
+    monkeypatch.setenv("BASETEN_BASE_URL", "https://example.test/v1")
+    constructor = MagicMock()
+    monkeypatch.setattr(agent, "AsyncOpenAI", constructor)
+    client, model = agent._hypothesis_client("baseten")
+    assert model == "meta-models/muse-spark-open-1026"
+    assert client is constructor.return_value
+    assert constructor.call_args.kwargs["base_url"] == "https://example.test/v1"

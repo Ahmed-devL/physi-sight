@@ -225,3 +225,4 @@ specs/
 .venv/
 node_modules/
 backend/cache/*.json
+backend/cache/*.lock
