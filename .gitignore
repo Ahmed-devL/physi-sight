@@ -226,3 +226,7 @@ specs/
 node_modules/
 backend/cache/*.json
 backend/cache/*.lock
+
+# Generated normalized motion videos and metadata
+/backend/cache/videos/*-motion-v1.mp4
+/backend/cache/videos/*-motion-v1.json
